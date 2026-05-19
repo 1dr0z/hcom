@@ -148,14 +148,34 @@ fn codex_supports_bypass_hook_trust() -> bool {
 /// Add Codex's runtime hook-trust bypass when supported.
 ///
 /// hcom installs native Codex hooks automatically, but Codex 0.131.0+ also
-/// requires unmanaged hooks to be trusted before they run. The bypass flag is
-/// invocation-scoped, so hcom injects it at launch instead of writing broad
-/// persistent trust state.
+/// requires unmanaged hooks to be trusted before they run. hcom normally writes
+/// exact trust state for its own hooks; the bypass flag is only a launch-time
+/// fallback when that state is missing and self-heal fails.
 pub fn add_hook_trust_bypass_if_supported(codex_args: &[String]) -> Vec<String> {
     if !codex_supports_bypass_hook_trust() {
         return codex_args.to_vec();
     }
+    if crate::hooks::codex::codex_hcom_hooks_trusted_locally() {
+        return codex_args.to_vec();
+    }
+    match crate::hooks::codex::ensure_codex_hcom_hooks_trusted() {
+        Ok(()) if crate::hooks::codex::codex_hcom_hooks_trusted_locally() => {
+            return codex_args.to_vec();
+        }
+        Ok(()) => crate::log::log_warn(
+            "codex",
+            "codex.hook_trust_self_heal_incomplete",
+            "Codex hook trust self-heal completed but trusted state still looks incomplete; falling back to hook-trust bypass",
+        ),
+        Err(e) => crate::log::log_warn(
+            "codex",
+            "codex.hook_trust_self_heal_failed",
+            &format!("Codex hook trust self-heal failed; falling back to hook-trust bypass: {e}"),
+        ),
+    }
 
+    // Codex's bypass flag is invocation-wide for unmanaged hooks, not scoped
+    // to hcom's hooks. Prefer exact trust state and use this only as fallback.
     let bypass_flag = vec![BYPASS_HOOK_TRUST_FLAG.to_string()];
     let bypass_spec = resolve_codex_args(Some(&bypass_flag), None);
     let cli_spec = resolve_codex_args(Some(codex_args), None);
@@ -359,6 +379,45 @@ mod tests {
         items.iter().map(|i| i.to_string()).collect()
     }
 
+    fn write_trusted_hcom_codex_hooks(codex_home: &std::path::Path) {
+        let hooks_path = codex_home.join("hooks.json");
+        std::fs::create_dir_all(codex_home).unwrap();
+        std::fs::write(
+            &hooks_path,
+            serde_json::json!({
+                "hooks": {
+                    "PreToolUse": [{
+                        "matcher": "Bash",
+                        "hooks": [{"type": "command", "command": "hcom codex-pretooluse"}]
+                    }],
+                    "PostToolUse": [{
+                        "matcher": "Bash",
+                        "hooks": [{"type": "command", "command": "hcom codex-posttooluse"}]
+                    }],
+                    "SessionStart": [{
+                        "matcher": "startup|resume|clear",
+                        "hooks": [{"type": "command", "command": "hcom codex-sessionstart"}]
+                    }],
+                    "UserPromptSubmit": [{
+                        "hooks": [{"type": "command", "command": "hcom codex-userpromptsubmit"}]
+                    }],
+                    "Stop": [{
+                        "hooks": [{"type": "command", "command": "hcom codex-stop"}]
+                    }]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "[features]\nhooks = true\n\n",
+        )
+        .unwrap();
+        crate::hooks::codex::ensure_codex_hcom_hooks_trusted().unwrap();
+    }
+
     struct EnvGuard {
         key: &'static str,
         original: Option<String>,
@@ -461,6 +520,8 @@ mod tests {
     #[serial]
     fn test_add_hook_trust_bypass_supported() {
         let _guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
+        let dir = tempfile::tempdir().unwrap();
+        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
         let args = s(&["-m", "o3"]);
         let result = add_hook_trust_bypass_if_supported(&args);
         assert!(result.contains(&BYPASS_HOOK_TRUST_FLAG.to_string()));
@@ -471,6 +532,52 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    #[serial]
+    fn test_add_hook_trust_bypass_skips_when_hcom_hooks_trusted() {
+        let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
+        let dir = tempfile::tempdir().unwrap();
+        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+        write_trusted_hcom_codex_hooks(dir.path());
+
+        let args = s(&["-m", "o3"]);
+        let result = add_hook_trust_bypass_if_supported(&args);
+        assert!(!result.contains(&BYPASS_HOOK_TRUST_FLAG.to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_add_hook_trust_bypass_self_heals_version_mismatch() {
+        let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
+        let dir = tempfile::tempdir().unwrap();
+        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+        write_trusted_hcom_codex_hooks(dir.path());
+        let config_path = dir.path().join("config.toml");
+        let stale = std::fs::read_to_string(&config_path)
+            .unwrap()
+            .replace("0.131.0", "0.130.0");
+        std::fs::write(&config_path, stale).unwrap();
+
+        let args = s(&["-m", "o3"]);
+        let result = add_hook_trust_bypass_if_supported(&args);
+        assert!(!result.contains(&BYPASS_HOOK_TRUST_FLAG.to_string()));
+        let healed = std::fs::read_to_string(config_path).unwrap();
+        assert!(healed.contains("hcom_codex_cli_version = \"0.131.0\""));
+    }
+
+    #[test]
+    #[serial]
+    fn test_add_hook_trust_bypass_falls_back_when_self_heal_fails() {
+        let _version_guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
+        let _hooks_guard = EnvGuard::set("HCOM_TEST_CODEX_HOOKS_LIST_JSON", "__fail__");
+        let dir = tempfile::tempdir().unwrap();
+        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
+
+        let args = s(&["-m", "o3"]);
+        let result = add_hook_trust_bypass_if_supported(&args);
+        assert!(result.contains(&BYPASS_HOOK_TRUST_FLAG.to_string()));
     }
 
     #[test]
@@ -501,6 +608,8 @@ mod tests {
     #[serial]
     fn test_add_hook_trust_bypass_keeps_resume_session_first() {
         let _guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
+        let dir = tempfile::tempdir().unwrap();
+        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
         let args = s(&["resume", "thread-1", "--model", "gpt-5"]);
         let result = add_hook_trust_bypass_if_supported(&args);
         assert_eq!(result[0], "resume");
@@ -618,6 +727,8 @@ mod tests {
     #[serial]
     fn test_preprocess_codex_args_full_pipeline() {
         let _guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
+        let dir = tempfile::tempdir().unwrap();
+        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
         init_config();
         let args = s(&["-m", "o3"]);
         let result = preprocess_codex_args(&args, "BOOTSTRAP", "workspace");
@@ -632,6 +743,8 @@ mod tests {
     #[serial]
     fn test_preprocess_resume_keeps_session_before_hook_trust_bypass() {
         let _guard = EnvGuard::set("HCOM_TEST_CODEX_CLI_VERSION", "codex 0.131.0");
+        let dir = tempfile::tempdir().unwrap();
+        let _codex_home_guard = EnvGuard::set("CODEX_HOME", dir.path().to_string_lossy().as_ref());
         init_config();
         let args = s(&["resume", "thread-1", "--model", "gpt-5"]);
         let result = preprocess_codex_args(&args, "BOOTSTRAP", "workspace");
