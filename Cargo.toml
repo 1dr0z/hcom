@@ -7,7 +7,7 @@ description = "Connect Claude Code, Gemini CLI, Codex, and OpenCode so agents ca
 license = "MIT"
 homepage = "https://github.com/aannoo/hcom"
 repository = "https://github.com/aannoo/hcom"
-rust-version = "1.86"
+rust-version = "1.88"
 
 [[bin]]
 name = "hcom"
