@@ -5,6 +5,7 @@
 //! initialization for newly launched or recovered sessions.
 
 use crate::db::{HcomDb, InstanceRow};
+use crate::instance_names::{PLACEHOLDER_CONTEXT, PLACEHOLDER_STATUS};
 use crate::instances::update_instance_position;
 use crate::shared::ST_INACTIVE;
 use crate::shared::time::{now_epoch_f64, now_epoch_i64};
@@ -493,6 +494,9 @@ pub fn initialize_instance_in_position_file(
             }
 
             let is_true_placeholder = existing.session_id.is_none();
+            let is_pending_placeholder = is_true_placeholder
+                && existing.status == PLACEHOLDER_STATUS
+                && existing.status_context == PLACEHOLDER_CONTEXT;
             if existing.last_event_id == 0 && is_true_placeholder {
                 let current_max = db.get_last_event_id();
                 let launch_event_id = std::env::var("HCOM_LAUNCH_EVENT_ID")
@@ -512,6 +516,10 @@ pub fn initialize_instance_in_position_file(
 
             if !updates.is_empty() {
                 let _ = db.update_instance_fields(instance_name, &updates);
+            }
+
+            if is_pending_placeholder {
+                auto_subscribe_defaults(db, instance_name, tool.unwrap_or(existing.tool.as_str()));
             }
 
             true
@@ -587,17 +595,14 @@ pub fn initialize_instance_in_position_file(
 
             match db.save_instance_named(instance_name, &data) {
                 Ok(true) => {
-                    let launcher =
-                        std::env::var("HCOM_LAUNCHED_BY").unwrap_or_else(|_| "unknown".to_string());
-                    let event_data = serde_json::json!({
-                        "action": "created",
-                        "by": launcher,
-                        "is_hcom_launched": is_launched,
-                        "is_subagent": parent_session_id.is_some(),
-                        "parent_name": parent_name.unwrap_or(""),
-                    });
-                    let _ = db.log_event("life", instance_name, &event_data);
-                    auto_subscribe_defaults(db, instance_name, tool.unwrap_or(""));
+                    log_created_and_auto_subscribe(
+                        db,
+                        instance_name,
+                        is_launched,
+                        parent_session_id,
+                        parent_name,
+                        tool.unwrap_or(""),
+                    );
                     true
                 }
                 _ => true,
@@ -605,6 +610,26 @@ pub fn initialize_instance_in_position_file(
         }
         Err(_) => false,
     }
+}
+
+fn log_created_and_auto_subscribe(
+    db: &HcomDb,
+    instance_name: &str,
+    is_launched: bool,
+    parent_session_id: Option<&str>,
+    parent_name: Option<&str>,
+    tool: &str,
+) {
+    let launcher = std::env::var("HCOM_LAUNCHED_BY").unwrap_or_else(|_| "unknown".to_string());
+    let event_data = serde_json::json!({
+        "action": "created",
+        "by": launcher,
+        "is_hcom_launched": is_launched,
+        "is_subagent": parent_session_id.is_some(),
+        "parent_name": parent_name.unwrap_or(""),
+    });
+    let _ = db.log_event("life", instance_name, &event_data);
+    auto_subscribe_defaults(db, instance_name, tool);
 }
 
 /// Create orphaned PTY identity — called when process binding exists but session_id
@@ -747,7 +772,34 @@ fn auto_subscribe_defaults(db: &HcomDb, instance_name: &str, tool: &str) {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+    use serial_test::serial;
     use std::path::PathBuf;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: tests using this guard are marked #[serial].
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: tests using this guard are marked #[serial].
+            unsafe {
+                match &self.previous {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     fn setup_test_db() -> (HcomDb, PathBuf) {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -1206,6 +1258,92 @@ mod tests {
             .filter_map(|r| r.ok())
             .collect();
         assert_eq!(rows.len(), 1, "should have 1 subscription");
+
+        cleanup(path);
+    }
+
+    #[test]
+    #[serial]
+    fn test_pending_placeholder_promotion_auto_subscribes_without_created_event() {
+        let _env = EnvVarGuard::set("HCOM_AUTO_SUBSCRIBE", "collision");
+        let (db, path) = setup_test_db();
+
+        let now = now_epoch_i64();
+        let mut data = serde_json::Map::new();
+        data.insert("name".into(), serde_json::json!("luna"));
+        data.insert("status".into(), serde_json::json!(PLACEHOLDER_STATUS));
+        data.insert(
+            "status_context".into(),
+            serde_json::json!(PLACEHOLDER_CONTEXT),
+        );
+        data.insert("created_at".into(), serde_json::json!(now));
+        data.insert(
+            "last_event_id".into(),
+            serde_json::json!(db.get_last_event_id()),
+        );
+        db.save_instance_named("luna", &data).unwrap();
+
+        let ok = initialize_instance_in_position_file(
+            &db,
+            "luna",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("codex"),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(ok);
+        let ok_again = initialize_instance_in_position_file(
+            &db,
+            "luna",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("codex"),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(ok_again);
+
+        let created_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE instance = 'luna'
+                   AND type = 'life'
+                   AND json_extract(data, '$.action') = 'created'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(created_count, 0);
+
+        let collision_sub_count: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM kv
+                 WHERE key LIKE 'events_sub:%'
+                   AND json_extract(value, '$.caller') = 'luna'
+                   AND json_extract(value, '$.filters.collision[0]') IS NOT NULL
+                   AND COALESCE(json_extract(value, '$.delivery_only'), 0) != 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(collision_sub_count, 1);
 
         cleanup(path);
     }

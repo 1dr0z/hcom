@@ -257,6 +257,9 @@ pub fn hash_to_name(input: &str, collision_attempt: u32) -> String {
     hash_words[idx].name.clone()
 }
 
+pub const PLACEHOLDER_STATUS: &str = "pending";
+pub const PLACEHOLDER_CONTEXT: &str = "new";
+
 /// Generate a unique instance name with flock-based reservation.
 /// Creates a placeholder row in DB to prevent TOCTOU races.
 pub fn generate_unique_name(db: &HcomDb) -> Result<String> {
@@ -299,8 +302,11 @@ pub fn generate_unique_name(db: &HcomDb) -> Result<String> {
         let last_event_id = db.get_last_event_id();
         let mut data = serde_json::Map::new();
         data.insert("name".into(), serde_json::json!(name));
-        data.insert("status".into(), serde_json::json!("pending"));
-        data.insert("status_context".into(), serde_json::json!("new"));
+        data.insert("status".into(), serde_json::json!(PLACEHOLDER_STATUS));
+        data.insert(
+            "status_context".into(),
+            serde_json::json!(PLACEHOLDER_CONTEXT),
+        );
         data.insert("created_at".into(), serde_json::json!(now));
         data.insert("last_event_id".into(), serde_json::json!(last_event_id));
         db.save_instance_named(&name, &data)?;
