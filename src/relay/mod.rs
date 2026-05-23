@@ -217,16 +217,16 @@ fn relay_uuid_short_key(device_uuid: &str) -> String {
     format!("{RELAY_UUID_SHORT_PREFIX}{device_uuid}")
 }
 
-/// Get legacy device short ID — FNV-1a hash to top-500 CVCV word, uppercased.
+/// Hash a device UUID to a 4-letter uppercase CVCV short ID.
 pub fn device_short_id(device_uuid: &str) -> String {
     instance_names::hash_to_name(device_uuid, 0).to_uppercase()
 }
 
 /// Get or persist the collision-resistant short ID for a device UUID.
 ///
-/// Existing mappings win first, then the legacy top-500 hash is grandfathered
-/// if it is still available. Only colliding new devices use the widened pool
-/// with deterministic probing.
+/// Existing mappings win first. Otherwise the natural hash is used if free,
+/// then linear probing walks the CVCV space; only when every CVCV slot is
+/// already taken by a different UUID does the fallback prefix kick in.
 pub fn device_short_id_for_db(db: &HcomDb, device_uuid: &str) -> String {
     let uuid_key = relay_uuid_short_key(device_uuid);
     if let Some(short_id) = safe_kv_get(db, &uuid_key) {
@@ -240,20 +240,11 @@ pub fn device_short_id_for_db(db: &HcomDb, device_uuid: &str) -> String {
         }
     }
 
-    let legacy = device_short_id(device_uuid);
-    match safe_kv_get(db, &relay_short_key(&legacy)) {
-        Some(owner) if owner != device_uuid => {}
-        _ => {
-            remember_device_short_id(db, device_uuid, &legacy);
-            return legacy;
-        }
-    }
-
-    let pool_len = instance_names::name_pool().len();
-    for attempt in 0..pool_len {
-        let short_id =
-            instance_names::hash_to_name_in_window(device_uuid, attempt as u32, pool_len)
-                .to_uppercase();
+    // Probing with attempt = 0..CVCV_SPACE visits every CVCV output exactly
+    // once (attempt 0 is the natural hash), so the fallback only triggers
+    // when all 5625 slots are owned by different UUIDs.
+    for attempt in 0..instance_names::CVCV_SPACE {
+        let short_id = instance_names::hash_to_name(device_uuid, attempt as u32).to_uppercase();
         match safe_kv_get(db, &relay_short_key(&short_id)) {
             Some(owner) if owner != device_uuid => continue,
             _ => {
@@ -795,26 +786,41 @@ mod tests {
         assert_eq!(wildcard_topic("relay-123"), "relay-123/+");
     }
 
-    #[test]
-    fn test_device_short_id() {
-        // Uses hash_to_name (FNV-1a → CVCV word),
-        assert_eq!(device_short_id("abcd-1234-efgh"), "VUNO");
-        assert_eq!(device_short_id("12345678"), "MOVA");
-        assert_eq!(device_short_id("device-123"), "REVA");
+    fn is_cvcv_upper(s: &str) -> bool {
+        const C: &[u8] = b"BDFGHKLMNPRSTVZ";
+        const V: &[u8] = b"AEIOU";
+        let b = s.as_bytes();
+        b.len() == 4
+            && C.contains(&b[0])
+            && V.contains(&b[1])
+            && C.contains(&b[2])
+            && V.contains(&b[3])
     }
 
     #[test]
-    fn test_device_short_id_for_db_grandfathers_legacy_mapping() {
+    fn test_device_short_id() {
+        // FNV-1a → CVCV word, uppercased. Deterministic, valid format, and
+        // different inputs typically produce different outputs.
+        for uuid in ["abcd-1234-efgh", "12345678", "device-123"] {
+            let s = device_short_id(uuid);
+            assert!(is_cvcv_upper(&s), "{s} is not 4-letter uppercase CVCV");
+            assert_eq!(device_short_id(uuid), s, "not deterministic");
+        }
+    }
+
+    #[test]
+    fn test_device_short_id_for_db_persists_natural_hash() {
         let db = test_db();
+        let natural = device_short_id("device-123");
         let short_id = device_short_id_for_db(&db, "device-123");
 
-        assert_eq!(short_id, "REVA");
+        assert_eq!(short_id, natural);
         assert_eq!(
             safe_kv_get(&db, "relay_uuid_short_device-123").as_deref(),
-            Some("REVA")
+            Some(natural.as_str())
         );
         assert_eq!(
-            safe_kv_get(&db, "relay_short_REVA").as_deref(),
+            safe_kv_get(&db, &format!("relay_short_{natural}")).as_deref(),
             Some("device-123")
         );
     }

@@ -109,8 +109,8 @@ pub fn update_instance_position(
 mod tests {
     use super::*;
     use crate::instance_names::{
-        allocate_name, banned_names, collect_taken_names, gold_names, hash_to_name, is_too_similar,
-        name_pool, score_name,
+        CVCV_SPACE, allocate_name, banned_names, collect_taken_names, gold_names, hash_to_name,
+        is_too_similar, name_pool, score_name,
     };
     use std::collections::HashSet;
     use std::path::PathBuf;
@@ -184,8 +184,26 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let alive = taken.clone();
-        let name = allocate_name(&|n| taken.contains(n), &alive, 200, 1200, 900.0).unwrap();
+        let name = allocate_name(&|n| taken.contains(n), &alive, 200, 1200, 30.0).unwrap();
         assert!(!taken.contains(&name));
+    }
+
+    #[test]
+    fn test_allocate_name_avoids_alive_first_letter() {
+        // Forces the deterministic greedy tier (attempts=0 skips weighted
+        // sampling) so the spread penalty's effect on adjusted ordering can
+        // be asserted without RNG.
+        let alive: HashSet<String> = [
+            "luna", "lola", "lara", "lana", "lena", "lina", "lori", "loki",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let name = allocate_name(&|n| alive.contains(n), &alive, 0, 1200, 30.0).unwrap();
+        assert!(
+            !name.starts_with('l'),
+            "greedy pick under spread penalty should avoid `l`, got {name}"
+        );
     }
 
     #[test]
@@ -200,6 +218,17 @@ mod tests {
         let n1 = hash_to_name("device-123", 0);
         let n2 = hash_to_name("device-123", 1);
         assert_ne!(n1, n2);
+    }
+
+    #[test]
+    fn test_hash_to_name_probing_covers_full_cvcv_space() {
+        // Walking attempts 0..CVCV_SPACE must visit every distinct CVCV
+        // output exactly once — relay collision probing relies on this so
+        // fallback only triggers when every slot is genuinely taken.
+        let outputs: HashSet<String> = (0..CVCV_SPACE)
+            .map(|a| hash_to_name("device-123", a as u32))
+            .collect();
+        assert_eq!(outputs.len(), CVCV_SPACE);
     }
 
     #[test]
