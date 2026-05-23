@@ -261,6 +261,58 @@ mod tests {
     }
 
     #[test]
+    fn test_collect_taken_names_ignores_placeholder_stops() {
+        let (db, path) = setup_test_db();
+        for (name, placeholder) in [("vera", true), ("zara", false)] {
+            db.conn()
+                .execute(
+                    "INSERT INTO events (timestamp, type, instance, data)
+                     VALUES (strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'life', ?1, ?2)",
+                    rusqlite::params![
+                        name,
+                        serde_json::json!({
+                            "action": "stopped",
+                            "placeholder": placeholder
+                        })
+                        .to_string()
+                    ],
+                )
+                .unwrap();
+        }
+
+        let (_, taken_names) = collect_taken_names(&db).unwrap();
+        assert!(!taken_names.contains("vera"));
+        assert!(taken_names.contains("zara"));
+
+        cleanup(path);
+    }
+
+    #[test]
+    fn test_save_instance_reservation_does_not_replace_existing_row() {
+        let (db, path) = setup_test_db();
+        let mut data = serde_json::Map::new();
+        data.insert("status".into(), serde_json::json!("pending"));
+        data.insert("status_context".into(), serde_json::json!("new"));
+        data.insert("created_at".into(), serde_json::json!(0.0));
+
+        db.save_instance_reservation("luna", &data).unwrap();
+
+        let mut replacement = serde_json::Map::new();
+        replacement.insert("status".into(), serde_json::json!("listening"));
+        assert!(db.save_instance_reservation("luna", &replacement).is_err());
+        assert_eq!(
+            db.get_instance_full("luna")
+                .unwrap()
+                .unwrap()
+                .status
+                .as_str(),
+            "pending"
+        );
+
+        cleanup(path);
+    }
+
+    #[test]
     fn test_parse_running_tasks() {
         assert!(!parse_running_tasks(None).active);
         assert!(!parse_running_tasks(Some("")).active);

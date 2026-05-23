@@ -228,7 +228,9 @@ pub(crate) fn collect_taken_names(db: &HcomDb) -> Result<(HashSet<String>, HashS
     let stopped: Vec<String> = {
         let mut stmt = db.conn().prepare(
             "SELECT DISTINCT instance FROM events
-             WHERE type = 'life' AND json_extract(data, '$.action') = 'stopped'",
+             WHERE type = 'life'
+               AND json_extract(data, '$.action') = 'stopped'
+               AND COALESCE(json_extract(data, '$.placeholder'), 0) != 1",
         )?;
         stmt.query_map([], |row| row.get(0))?
             .filter_map(|r| r.ok())
@@ -242,8 +244,16 @@ pub(crate) fn collect_taken_names(db: &HcomDb) -> Result<(HashSet<String>, HashS
 /// Hash any string to a memorable 4-char name.
 /// Used for device short IDs. Uses FNV-1a hash for distribution.
 pub fn hash_to_name(input: &str, collision_attempt: u32) -> String {
+    hash_to_name_in_window(input, collision_attempt, 500)
+}
+
+pub(crate) fn hash_to_name_in_window(
+    input: &str,
+    collision_attempt: u32,
+    top_window: usize,
+) -> String {
     let pool = name_pool();
-    let hash_words = &pool[..pool.len().min(500)];
+    let hash_words = &pool[..pool.len().min(top_window.max(1))];
 
     // FNV-1a hash (32-bit)
     let mut h: u32 = 2166136261;
@@ -260,9 +270,25 @@ pub fn hash_to_name(input: &str, collision_attempt: u32) -> String {
 pub const PLACEHOLDER_STATUS: &str = "pending";
 pub const PLACEHOLDER_CONTEXT: &str = "new";
 
+pub(crate) fn allocate_unreserved_name(db: &HcomDb) -> Result<String> {
+    let (alive_names, taken_names) = collect_taken_names(db)?;
+
+    allocate_name(
+        &|n| taken_names.contains(n) || db.get_instance_full(n).ok().flatten().is_some(),
+        &alive_names,
+        200,
+        1200,
+        900.0,
+    )
+}
+
 /// Generate a unique instance name with flock-based reservation.
 /// Creates a placeholder row in DB to prevent TOCTOU races.
 pub fn generate_unique_name(db: &HcomDb) -> Result<String> {
+    reserve_generated_name(db)
+}
+
+pub(crate) fn reserve_generated_name(db: &HcomDb) -> Result<String> {
     use std::fs::{File, create_dir_all};
 
     let lock_path = db
@@ -287,15 +313,7 @@ pub fn generate_unique_name(db: &HcomDb) -> Result<String> {
         .map_err(|(_, e)| anyhow::anyhow!("flock failed: {}", e))?;
 
     let result = (|| -> Result<String> {
-        let (alive_names, taken_names) = collect_taken_names(db)?;
-
-        let name = allocate_name(
-            &|n| taken_names.contains(n) || db.get_instance_full(n).ok().flatten().is_some(),
-            &alive_names,
-            200,
-            1200,
-            900.0,
-        )?;
+        let name = allocate_unreserved_name(db)?;
 
         // Reserve with placeholder row
         let now = now_epoch_i64();
@@ -309,7 +327,7 @@ pub fn generate_unique_name(db: &HcomDb) -> Result<String> {
         );
         data.insert("created_at".into(), serde_json::json!(now));
         data.insert("last_event_id".into(), serde_json::json!(last_event_id));
-        db.save_instance_named(&name, &data)?;
+        db.save_instance_reservation(&name, &data)?;
 
         Ok(name)
     })();
