@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 pub enum VerifyFailReason {
     #[error("hooks.json settings unreadable or empty")]
     SettingsUnreadableOrEmpty,
+    #[error("agy permissions missing or incomplete in: {0}")]
+    PermissionsMissing(PathBuf),
     #[error("hooks.json missing 'hcom-lifecycle' group key")]
     HcomLifecycleKeyMissing,
     #[error("hook event '{0}' missing or empty")]
@@ -100,7 +102,7 @@ fn hook_lockfile_cleanup_cmd() -> String {
 
 /// Try to set up Antigravity hooks in `hooks.json`.
 /// Reads existing hooks.json, merges "hcom-lifecycle" group, and preserves all other keys.
-pub fn try_setup_antigravity_hooks(_include_permissions: bool) -> Result<(), SetupError> {
+pub fn try_setup_antigravity_hooks(include_permissions: bool) -> Result<(), SetupError> {
     let hooks_path = get_antigravity_hooks_path();
     if let Some(parent) = hooks_path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -222,17 +224,27 @@ pub fn try_setup_antigravity_hooks(_include_permissions: bool) -> Result<(), Set
         }
     })?;
 
-    verify_hooks_at(&hooks_path).map_err(|reason| SetupError::PostWriteVerifyFailed {
-        path: hooks_path,
-        reason,
+    // Agy stores permissions in its own settings.json under `permissions.allow`
+    // using `command(...)` rules (not the gemini-cli TOML policy engine).
+    if include_permissions {
+        setup_antigravity_permissions();
+    } else {
+        remove_antigravity_permissions();
+    }
+
+    verify_hooks_at(&hooks_path, include_permissions).map_err(|reason| {
+        SetupError::PostWriteVerifyFailed {
+            path: hooks_path,
+            reason,
+        }
     })?;
 
     Ok(())
 }
 
 /// Verify if Antigravity hooks are correctly installed.
-pub fn verify_antigravity_hooks_installed(_check_permissions: bool) -> bool {
-    verify_hooks_at(&get_antigravity_hooks_path()).is_ok()
+pub fn verify_antigravity_hooks_installed(check_permissions: bool) -> bool {
+    verify_hooks_at(&get_antigravity_hooks_path(), check_permissions).is_ok()
 }
 
 /// Cleanly remove the `"hcom-lifecycle"` group key from `hooks.json`.
@@ -271,7 +283,7 @@ pub fn remove_antigravity_hooks() -> bool {
     true
 }
 
-fn verify_hooks_at(path: &Path) -> Result<(), VerifyFailReason> {
+fn verify_hooks_at(path: &Path, check_permissions: bool) -> Result<(), VerifyFailReason> {
     if !path.exists() {
         return Err(VerifyFailReason::SettingsUnreadableOrEmpty);
     }
@@ -632,7 +644,164 @@ fn verify_hooks_at(path: &Path) -> Result<(), VerifyFailReason> {
         });
     }
 
+    // Check permissions in agy settings.json
+    if check_permissions {
+        let settings_path = get_antigravity_settings_path();
+        if !antigravity_permissions_complete(&settings_path) {
+            return Err(VerifyFailReason::PermissionsMissing(settings_path));
+        }
+    }
+
     Ok(())
+}
+
+/// Path to the Antigravity CLI's settings.json (under `~/.gemini/antigravity-cli/`).
+fn get_antigravity_settings_path() -> PathBuf {
+    crate::runtime_env::gemini_family_config_dir()
+        .join("antigravity-cli")
+        .join("settings.json")
+}
+
+/// Build the list of `command(...)` rules for safe hcom commands.
+fn antigravity_permission_rules() -> Vec<String> {
+    let mut rules = Vec::new();
+    for prefix in &["hcom", "uvx hcom"] {
+        for cmd in crate::hooks::common::SAFE_HCOM_COMMANDS {
+            rules.push(format!("command({} {})", prefix, cmd));
+        }
+    }
+    rules
+}
+
+/// Merge hcom permission rules into `~/.gemini/antigravity-cli/settings.json`.
+/// Preserves any other keys and pre-existing entries in `permissions.allow`.
+fn setup_antigravity_permissions() -> bool {
+    let path = get_antigravity_settings_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    let mut root = if path.exists() {
+        match std::fs::read_to_string(&path) {
+            Ok(s) => serde_json::from_str::<Value>(&s)
+                .ok()
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default(),
+            Err(_) => return false,
+        }
+    } else {
+        serde_json::Map::new()
+    };
+
+    let permissions = root
+        .entry("permissions".to_string())
+        .or_insert_with(|| json!({}));
+    let permissions_obj = match permissions.as_object_mut() {
+        Some(o) => o,
+        None => return false,
+    };
+    let allow = permissions_obj
+        .entry("allow".to_string())
+        .or_insert_with(|| json!([]));
+    let allow_arr = match allow.as_array_mut() {
+        Some(a) => a,
+        None => return false,
+    };
+
+    let wanted = antigravity_permission_rules();
+    let mut existing: std::collections::HashSet<String> = allow_arr
+        .iter()
+        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+        .collect();
+    for rule in &wanted {
+        if existing.insert(rule.clone()) {
+            allow_arr.push(json!(rule));
+        }
+    }
+
+    let json_str = match serde_json::to_string_pretty(&Value::Object(root)) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    crate::paths::atomic_write(&path, &json_str)
+}
+
+/// Remove hcom rules from agy settings.json. Cleans `permissions.allow` and
+/// `permissions` if they become empty. Leaves the file otherwise untouched.
+fn remove_antigravity_permissions() -> bool {
+    let path = get_antigravity_settings_path();
+    if !path.exists() {
+        return true;
+    }
+    let content = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let mut val: Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let root = match val.as_object_mut() {
+        Some(o) => o,
+        None => return false,
+    };
+
+    let wanted: std::collections::HashSet<String> =
+        antigravity_permission_rules().into_iter().collect();
+
+    let mut changed = false;
+    if let Some(permissions) = root.get_mut("permissions").and_then(|v| v.as_object_mut()) {
+        if let Some(allow) = permissions.get_mut("allow").and_then(|v| v.as_array_mut()) {
+            let before = allow.len();
+            allow.retain(|v| v.as_str().is_none_or(|s| !wanted.contains(s)));
+            if allow.len() != before {
+                changed = true;
+            }
+            if allow.is_empty() {
+                permissions.remove("allow");
+                changed = true;
+            }
+        }
+        if permissions.is_empty() {
+            root.remove("permissions");
+            changed = true;
+        }
+    }
+
+    if !changed {
+        return true;
+    }
+
+    let json_str = match serde_json::to_string_pretty(&val) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    crate::paths::atomic_write(&path, &json_str)
+}
+
+/// Check that every hcom rule we install is present in agy settings.json.
+fn antigravity_permissions_complete(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(val) = serde_json::from_str::<Value>(&content) else {
+        return false;
+    };
+    let Some(allow) = val
+        .get("permissions")
+        .and_then(|p| p.get("allow"))
+        .and_then(|a| a.as_array())
+    else {
+        return false;
+    };
+    let installed: std::collections::HashSet<&str> =
+        allow.iter().filter_map(|v| v.as_str()).collect();
+    antigravity_permission_rules()
+        .iter()
+        .all(|rule| installed.contains(rule.as_str()))
 }
 
 /// agy Stop payloads that end a turn but not the session (do not soft-stop).
