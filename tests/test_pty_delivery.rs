@@ -682,11 +682,17 @@ fn run_pty_test(tool: &str) {
     logln!(log, "  OK: Baseline event ID: {baseline_event}");
 
     let t1 = Instant::now();
-    // Phrasing matters: gemini-2.5-flash-lite interprets human-style directives
-    // ("do not reply") as needing user confirmation and calls ask_user → approval
-    // gate, blocking the test forever. `[hcom heartbeat] ignore` reads as an
-    // automated signal and reliably returns to listening in 2-3s with no tool calls.
-    send_msg(&format!("@{instance_name} [hcom heartbeat] ignore"));
+    // Phrasing matters on two axes:
+    // 1. Gemini-2.5-flash-lite interprets human-style directives ("do not reply")
+    //    as needing user confirmation and calls ask_user → approval gate,
+    //    blocking forever. Keep the `[hcom heartbeat]` automated-signal framing.
+    // 2. Codex and OpenCode would otherwise run `hcom send … --intent ack` and
+    //    burn tokens (the ack is rejected by hcom since inform can't be acked,
+    //    but the tool call still fires). Explicit "no tools, no hcom send" cuts
+    //    that out without tripping (1).
+    send_msg(&format!(
+        "@{instance_name} [hcom heartbeat] automated test ping. acknowledge inline with \"ok\" only. no tools. no hcom send."
+    ));
     logln!(log, "  OK: Message sent");
 
     // Wait for delivery event
@@ -827,7 +833,7 @@ fn run_pty_test(tool: &str) {
     let baseline_event2 = get_last_event_id(&base_name);
 
     send_msg(&format!(
-        "@{instance_name} [hcom heartbeat-2 should-block] ignore"
+        "@{instance_name} [hcom heartbeat-2 should-block] automated test ping. acknowledge inline with \"ok\" only. no tools. no hcom send."
     ));
     logln!(log, "  OK: Message sent (should be blocked)");
 
