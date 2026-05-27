@@ -19,6 +19,7 @@ use crate::hooks::gemini::derive_gemini_transcript_path;
 use crate::launcher::{self, LaunchParams, LaunchResult};
 use crate::log::log_info;
 use crate::router::GlobalFlags;
+use crate::shared::ST_INACTIVE;
 use crate::tools::{codex_args, gemini_args};
 
 /// Where to load the resume/fork plan from.
@@ -325,7 +326,10 @@ fn prepare_resume_plan_from_source(
         display_name,
     ) = match source {
         ResumeSource::Instance { name } => {
-            if !fork && let Ok(Some(_)) = db.get_instance_full(name) {
+            if !fork
+                && let Ok(Some(inst)) = db.get_instance_full(name)
+                && inst.status != ST_INACTIVE
+            {
                 bail!("'{}' is still active — run hcom kill {} first", name, name);
             }
             let (tool, sid, largs, tag, bg, leid, snap) = if fork {
@@ -725,6 +729,11 @@ fn validate_resume_operation(tool: &str, fork: bool) -> Result<()> {
     if fork && tool == "gemini" {
         bail!("Gemini does not support session forking (hcom f)");
     }
+    if fork && tool == "antigravity" {
+        bail!(
+            "Antigravity does not support session forking (hcom f): agy exposes no fork primitive"
+        );
+    }
     Ok(())
 }
 
@@ -944,6 +953,10 @@ fn build_resume_args(tool: &str, session_id: &str, fork: bool) -> Vec<String> {
             }
             args
         }
+        "antigravity" => {
+            // agy uses --conversation <id> to resume; fork has no CLI primitive.
+            vec!["--conversation".to_string(), session_id.to_string()]
+        }
         _ => Vec::new(),
     }
 }
@@ -974,11 +987,77 @@ fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<
             merged.rebuild_tokens(true, true)
         }
         "opencode" => merge_opencode_args(original, resume),
+        "antigravity" => merge_antigravity_args(original, resume),
         _ => {
             // For unknown tools: resume args only.
             resume.to_vec()
         }
     }
+}
+
+/// Merge agy original args with resume args.
+///
+/// Strips prior session/prompt flags (--conversation, --continue/-c,
+/// --prompt/--prompt-interactive/-p/-i, --print) from the original to prevent
+/// conflicting session IDs or prompts from the last launch bleeding into the resume.
+/// Non-session flags (--sandbox, --add-dir, etc.) are preserved.
+///
+/// agy uses Go's `flag` package, which accepts `--flag value`, `--flag=value`,
+/// `-flag value`, and `-flag=value`. All four forms are stripped.
+fn merge_antigravity_args(original: &[String], resume: &[String]) -> Vec<String> {
+    // Flag names without leading dashes — match against any leading-dash form.
+    let session_flag_names: &[&str] = &[
+        "conversation",
+        "continue",
+        "c",
+        "prompt",
+        "prompt-interactive",
+        "i",
+        "print",
+        "p",
+    ];
+    // Flag names that consume the next token as their value when used in split form.
+    let value_flag_names: &[&str] = &["conversation", "prompt", "prompt-interactive"];
+
+    // Returns the bare flag name (e.g. "conversation") if `token` matches `--name`,
+    // `-name`, `--name=value`, or `-name=value` for some name in `names`.
+    fn match_flag(token: &str, names: &[&str]) -> Option<String> {
+        let trimmed = token
+            .strip_prefix("--")
+            .or_else(|| token.strip_prefix('-'))?;
+        let name = trimmed.split('=').next().unwrap_or(trimmed);
+        if names.contains(&name) {
+            Some(name.to_string())
+        } else {
+            None
+        }
+    }
+
+    let mut preserved = Vec::new();
+    let mut i = 0;
+    while i < original.len() {
+        let token = &original[i];
+        if let Some(name) = match_flag(token, session_flag_names) {
+            // `--flag=value` or `-flag=value`: one token, no following value.
+            if token.contains('=') {
+                i += 1;
+                continue;
+            }
+            // Bare flag: consume the next token only if this flag takes a value.
+            if value_flag_names.contains(&name.as_str()) && i + 1 < original.len() {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        preserved.push(token.clone());
+        i += 1;
+    }
+
+    let mut merged = resume.to_vec();
+    merged.extend(preserved);
+    merged
 }
 
 fn merge_opencode_args(original: &[String], resume: &[String]) -> Vec<String> {
@@ -1583,6 +1662,140 @@ mod tests {
     #[test]
     fn test_validate_resume_operation_allows_gemini_resume() {
         assert!(validate_resume_operation("gemini", false).is_ok());
+    }
+
+    #[test]
+    fn test_build_resume_args_antigravity_resume() {
+        let args = build_resume_args("antigravity", "conv-abc", false);
+        assert_eq!(args, s(&["--conversation", "conv-abc"]));
+    }
+
+    #[test]
+    fn test_validate_resume_operation_rejects_antigravity_fork() {
+        let err = validate_resume_operation("antigravity", true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Antigravity") && err.contains("fork"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_resume_operation_allows_antigravity_resume() {
+        assert!(validate_resume_operation("antigravity", false).is_ok());
+    }
+
+    #[test]
+    fn test_merge_resume_args_antigravity_strips_session_and_prompt_flags() {
+        // --conversation (value-consuming), --continue/-c (bare), --prompt-interactive (value), -p (bare)
+        let merged = merge_resume_args(
+            "antigravity",
+            &s(&[
+                "--conversation",
+                "old-conv",
+                "--sandbox",
+                "--continue",
+                "--prompt-interactive",
+                "old prompt",
+                "-p",
+            ]),
+            &s(&["--conversation", "new-conv"]),
+        );
+        assert_eq!(merged, s(&["--conversation", "new-conv", "--sandbox"]));
+    }
+
+    #[test]
+    fn test_merge_resume_args_antigravity_preserves_sandbox_and_add_dir() {
+        let merged = merge_resume_args(
+            "antigravity",
+            &s(&["--sandbox", "--add-dir", "/some/path"]),
+            &s(&["--conversation", "conv-xyz"]),
+        );
+        assert_eq!(
+            merged,
+            s(&[
+                "--conversation",
+                "conv-xyz",
+                "--sandbox",
+                "--add-dir",
+                "/some/path"
+            ])
+        );
+    }
+
+    /// agy accepts `--flag=value` (Go flag convention). Stale `--conversation=old`
+    /// in the original launch_args must not survive to conflict with the new --conversation.
+    #[test]
+    fn test_merge_resume_args_antigravity_strips_equals_form() {
+        let merged = merge_resume_args(
+            "antigravity",
+            &s(&[
+                "--conversation=old-id",
+                "--sandbox",
+                "--prompt-interactive=old prompt",
+                "--prompt=alt",
+            ]),
+            &s(&["--conversation", "new-id"]),
+        );
+        assert_eq!(merged, s(&["--conversation", "new-id", "--sandbox"]));
+    }
+
+    /// agy / Go flag also accepts single-dash long form (`-conversation=old`).
+    #[test]
+    fn test_merge_resume_args_antigravity_strips_single_dash_long_form() {
+        let merged = merge_resume_args(
+            "antigravity",
+            &s(&[
+                "-conversation",
+                "old-id",
+                "-prompt-interactive=stale",
+                "--sandbox",
+                "-c",
+            ]),
+            &s(&["--conversation", "new-id"]),
+        );
+        assert_eq!(merged, s(&["--conversation", "new-id", "--sandbox"]));
+    }
+
+    #[test]
+    fn test_resume_inactive_agy_row_is_resumable() {
+        let db = test_db();
+        let mut data = serde_json::Map::new();
+        data.insert("session_id".into(), json!("agy-session-001"));
+        data.insert("tool".into(), json!("antigravity"));
+        // Soft-finalized: instance row exists but status=inactive
+        data.insert("status".into(), json!(ST_INACTIVE));
+        data.insert("created_at".into(), json!(1.0));
+        db.save_instance_named("zeno", &data).unwrap();
+
+        // Emit a stopped life event so load_stopped_snapshot can find the snapshot
+        let snapshot = serde_json::json!({
+            "action": "stopped",
+            "snapshot": {
+                "tool": "antigravity",
+                "session_id": "agy-session-001",
+                "launch_args": "[]",
+                "tag": "",
+                "background": 0,
+                "last_event_id": 0,
+                "directory": "/tmp"
+            }
+        });
+        db.conn()
+            .execute(
+                "INSERT INTO events (timestamp, type, instance, data) VALUES (?, 'life', 'zeno', ?)",
+                rusqlite::params!["2026-01-01T00:00:00Z", snapshot.to_string()],
+            )
+            .unwrap();
+
+        // Should NOT bail — inactive agy row is resumable.
+        let result = prepare_resume_plan(&db, "zeno", false, &[], &GlobalFlags::default());
+        assert!(
+            result.is_ok(),
+            "expected inactive agy row to be resumable, got: {:?}",
+            result.err()
+        );
     }
 
     #[test]

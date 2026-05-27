@@ -751,9 +751,10 @@ const AGY_SPEC: ToolHelpSpec = ToolHelpSpec {
     unique_examples: &[
         ("hcom antigravity", "Long-form alias"),
         ("hcom agy --sandbox", "Flags forwarded to agy"),
+        ("hcom r <name>", "Resume a stopped agy session"),
     ],
     extra_env: &[],
-    has_resume: false,
+    has_resume: true,
     has_fork: false,
 };
 
@@ -1224,8 +1225,9 @@ mod tests {
         assert!(help.contains("hcom agy --sandbox"));
         assert!(!help.contains("hcom agy --model"));
         assert!(help.contains("Run \"agy --help\" for agy options."));
-        assert!(help.contains("Antigravity resume/fork is not currently wired through hcom."));
-        assert!(!help.contains("hcom r <target>"));
+        // Resume now supported via --conversation; fork still unsupported.
+        assert!(help.contains("hcom r <target>"));
+        assert!(help.contains("Antigravity does not support session forking (hcom f)."));
         assert!(!help.contains("HCOM_AGY_ARGS"));
         assert!(!help.contains("HCOM_ANTIGRAVITY_ARGS"));
 
