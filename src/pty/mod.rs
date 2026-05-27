@@ -63,6 +63,20 @@ fn title_write_safe(had_pty_output: bool, pending_utf8: u8, pending_escape: Pend
     !had_pty_output && pending_utf8 == 0 && pending_escape == PendingEscape::None
 }
 
+/// Detect the submit edge from input text snapshots.
+///
+/// The prompt can briefly become undetectable while a TUI redraws, so treat
+/// non-empty -> None the same as non-empty -> empty. That preserves the
+/// cooldown across a Some("text") -> None -> Some("") transition.
+fn prompt_submit_observed(
+    previous_input_text: Option<&str>,
+    current_input_text: Option<&str>,
+) -> bool {
+    let had_text = previous_input_text.is_some_and(|text| !text.is_empty());
+    let has_text_now = current_input_text.is_some_and(|text| !text.is_empty());
+    had_text && !has_text_now
+}
+
 /// Check if data ends inside an incomplete escape sequence.
 ///
 /// Scans backwards for the last ESC (0x1b) and checks whether the escape
@@ -1270,7 +1284,17 @@ impl Proxy {
                 || (self.config.tool == "antigravity"
                     && self.screen.is_antigravity_approval_visible());
             let input_text = self.screen.get_input_box_text(&self.config.tool);
-            state.prompt_empty = input_text.as_ref().is_some_and(|t| t.is_empty());
+            let new_prompt_empty = input_text.as_ref().is_some_and(|t| t.is_empty());
+            // Stamp submit-edge cooldown when input transitions from a known
+            // non-empty value to empty or briefly undetected. Guards against
+            // the race where the delivery gate sees `prompt_empty + listening`
+            // in the gap before the tool's UserPromptSubmit hook flips status
+            // to active. Requiring a previously-known non-empty input avoids
+            // stamping on the initial false->true edge at startup.
+            if prompt_submit_observed(state.input_text.as_deref(), input_text.as_deref()) {
+                state.last_prompt_submit = Some(Instant::now());
+            }
+            state.prompt_empty = new_prompt_empty;
             state.input_text = input_text;
             // visible_tail is only consumed by the launch-blocked heuristic;
             // skip the screen walk + allocation once launch phase is over.
@@ -1578,7 +1602,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::initialize_delivery_components;
+    use super::{initialize_delivery_components, prompt_submit_observed};
     use anyhow::anyhow;
     use rusqlite::Connection;
     use std::path::PathBuf;
@@ -1606,6 +1630,27 @@ mod tests {
 
     fn cleanup_test_db(path: PathBuf) {
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn prompt_submit_observed_when_text_clears() {
+        assert!(prompt_submit_observed(Some("run tests"), Some("")));
+    }
+
+    #[test]
+    fn prompt_submit_observed_when_text_temporarily_undetected() {
+        assert!(prompt_submit_observed(Some("run tests"), None));
+    }
+
+    #[test]
+    fn prompt_submit_observed_ignores_startup_empty_edge() {
+        assert!(!prompt_submit_observed(None, Some("")));
+        assert!(!prompt_submit_observed(Some(""), Some("")));
+    }
+
+    #[test]
+    fn prompt_submit_observed_ignores_text_edits() {
+        assert!(!prompt_submit_observed(Some("run"), Some("run tests")));
     }
 
     #[test]

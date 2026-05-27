@@ -347,6 +347,7 @@ pub(crate) fn gate_block_detail(reason: &str) -> &'static str {
     match reason {
         "not_idle" => "waiting for idle status",
         "user_active" => "user is typing",
+        "submit_settle" => "waiting for prompt submit to settle",
         "not_ready" => "prompt not visible",
         "output_unstable" => "output still streaming",
         "prompt_has_text" => "uncommitted text in prompt",
@@ -457,10 +458,11 @@ fn format_wake_message_line(
 ///    Claude/Gemini hooks also set status="blocked" on approval which fails this check.
 /// 2. `block_on_approval` - No pending approval prompt (OSC9 detection in PTY).
 /// 3. `block_on_user_activity` - No keystrokes within cooldown (default 0.5s, 3s for Claude).
-/// 4. `require_ready_prompt` - Ready pattern visible on screen (e.g., "? for shortcuts").
+/// 4. Submit-settle cooldown - Do not inject during the short screen/hook race after submit.
+/// 5. `require_ready_prompt` - Ready pattern visible on screen (e.g., "? for shortcuts").
 ///    Pattern hidden when user has uncommitted text or is in a submenu (slash menu).
 ///    Note: Claude hides this in accept-edits mode, so Claude disables this check.
-/// 5. `require_prompt_empty` - Check if prompt has no user text.
+/// 6. `require_prompt_empty` - Check if prompt has no user text.
 ///    Claude-specific: Uses VT100 dim attribute detection to distinguish placeholder text
 ///    (dim) from user input (not dim). Implemented in screen.rs get_claude_input_text().
 #[derive(Clone)]
@@ -674,6 +676,15 @@ pub struct ScreenState {
     pub last_output: Instant,
     /// Terminal width in columns
     pub cols: u16,
+    /// Set when input_text transitions from non-empty to empty or temporarily
+    /// undetected, i.e. a prompt was likely just submitted. The DB-side
+    /// `status=active` update from the tool's UserPromptSubmit hook lags this
+    /// screen-visible transition by a few hundred milliseconds, so the delivery
+    /// gate must wait out that window or it will double-deliver: once via the
+    /// hook (after the user's prompt runs) and once via PTY inject (during the
+    /// race window where the gate sees
+    /// `listening` + `prompt_empty`). See `SUBMIT_SETTLE_COOLDOWN_MS`.
+    pub last_prompt_submit: Option<Instant>,
 }
 
 impl Default for ScreenState {
@@ -687,9 +698,16 @@ impl Default for ScreenState {
             last_user_input: Instant::now(),
             last_output: Instant::now(),
             cols: 80,
+            last_prompt_submit: None,
         }
     }
 }
+
+/// Window after an observed prompt-submit during which the delivery gate refuses
+/// to inject. Covers the lag between the screen-visible input clear and the tool
+/// hook's `status=active` update. Tuned from PTY test traces where the gap was
+/// about 1s; round up for headroom.
+pub(crate) const SUBMIT_SETTLE_COOLDOWN_MS: u64 = 1500;
 
 impl DeliveryState {
     /// Check if user is actively typing (within cooldown)
@@ -713,7 +731,10 @@ impl DeliveryState {
 /// Check order determines gate.reason but NOT status behavior:
 /// 1. require_idle - if agent active, reason="not_idle"
 /// 2. approval - if approval showing, reason="approval"
-/// 3. etc.
+/// 3. block_on_user_activity - if user recently typed, reason="user_active"
+/// 4. submit-settle cooldown - if prompt just submitted, reason="submit_settle"
+/// 5. require_ready_prompt - if prompt not visible, reason="not_ready"
+/// 6. require_prompt_empty - if prompt has user text, reason="prompt_has_text"
 ///
 /// The delivery loop checks screen.approval directly for status="blocked",
 /// so Codex OSC9 detection works even when agent is active (gate returns "not_idle").
@@ -742,6 +763,20 @@ pub(crate) fn evaluate_gate(
         return GateResult {
             safe: false,
             reason: "user_active",
+        };
+    }
+    // Submit-edge cooldown: after the screen shows the input clearing, the
+    // tool's hook hasn't yet flipped DB status to active. Without this,
+    // `require_idle + prompt_empty` both look true and we double-inject. Only
+    // applies to tools that gate on idleness; bootstrap-style paths (opencode)
+    // run with `require_idle=false` and skip this entirely.
+    if config.require_idle
+        && let Some(submit_at) = screen.last_prompt_submit
+        && submit_at.elapsed().as_millis() < SUBMIT_SETTLE_COOLDOWN_MS as u128
+    {
+        return GateResult {
+            safe: false,
+            reason: "submit_settle",
         };
     }
     if config.require_ready_prompt && !screen.ready {
@@ -1981,6 +2016,7 @@ mod tests {
             last_user_input: Instant::now() - Duration::from_secs(10),
             last_output: Instant::now() - Duration::from_secs(10),
             cols: 80,
+            last_prompt_submit: None,
         }
     }
 
@@ -2044,6 +2080,45 @@ mod tests {
         let result = evaluate_gate(&config, &state, true);
         assert!(!result.safe);
         assert_eq!(result.reason, "user_active");
+    }
+
+    #[test]
+    fn gate_blocks_during_submit_settle_window() {
+        let config = ToolConfig::codex();
+        let mut screen = safe_screen();
+        screen.last_prompt_submit = Some(Instant::now());
+        let state = make_state(screen, 500);
+        let result = evaluate_gate(&config, &state, true);
+        assert!(
+            !result.safe,
+            "gate must block during submit-settle window to prevent racing hook delivery"
+        );
+        assert_eq!(result.reason, "submit_settle");
+    }
+
+    #[test]
+    fn gate_passes_after_submit_settle_expires() {
+        let config = ToolConfig::codex();
+        let mut screen = safe_screen();
+        screen.last_prompt_submit =
+            Some(Instant::now() - Duration::from_millis(SUBMIT_SETTLE_COOLDOWN_MS + 100));
+        let state = make_state(screen, 500);
+        let result = evaluate_gate(&config, &state, true);
+        assert!(result.safe);
+        assert_eq!(result.reason, "ok");
+    }
+
+    #[test]
+    fn gate_skips_submit_settle_when_idle_not_required() {
+        // OpenCode bootstrap path runs with require_idle=false. The hook-vs-PTY
+        // race that submit_settle guards against can't happen there, so the
+        // cooldown shouldn't apply.
+        let config = ToolConfig::opencode();
+        let mut screen = safe_screen();
+        screen.last_prompt_submit = Some(Instant::now());
+        let state = make_state(screen, 500);
+        let result = evaluate_gate(&config, &state, true);
+        assert!(result.safe);
     }
 
     #[test]
@@ -2132,6 +2207,10 @@ mod tests {
     fn gate_block_detail_known_reasons() {
         assert_eq!(gate_block_detail("not_idle"), "waiting for idle status");
         assert_eq!(gate_block_detail("approval"), "waiting for user approval");
+        assert_eq!(
+            gate_block_detail("submit_settle"),
+            "waiting for prompt submit to settle"
+        );
         assert_eq!(gate_block_detail("unknown"), "blocked");
     }
 
