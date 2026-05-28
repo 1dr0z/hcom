@@ -5,6 +5,7 @@
 
 use crate::db::HcomDb;
 use crate::shared::CommandContext;
+use crate::tool::Tool;
 
 /// Parsed arguments for `hcom hooks`.
 #[derive(clap::Parser, Debug)]
@@ -15,45 +16,27 @@ pub struct HooksArgs {
     pub args: Vec<String>,
 }
 
-/// Valid tool names for hooks management.
-const HOOK_TOOLS: &[&str] = &["claude", "gemini", "codex", "opencode", "antigravity"];
+/// Valid tool names for hooks management. Must stay in sync with released
+/// hook-bearing specs in `integration_spec.rs` — see
+/// `router::tests::hook_tools_match_released_specs_with_hooks` for the guard.
+pub(crate) const HOOK_TOOLS: &[&str] = &["claude", "gemini", "codex", "opencode", "antigravity"];
 
 /// Get hook installation status for each tool.
+///
+/// Iterates [`HOOK_TOOLS`] and routes through the `Tool::*` hook adapter so a
+/// new hook-bearing tool only needs a `Tool` arm + a HOOK_TOOLS entry.
 fn get_tool_status() -> Vec<(&'static str, bool, String)> {
-    let claude_installed = crate::hooks::claude::verify_claude_hooks_installed(None, false);
-    let claude_path = crate::hooks::claude::get_claude_settings_path()
-        .to_string_lossy()
-        .to_string();
-
-    let gemini_installed = crate::hooks::gemini::verify_gemini_hooks_installed(false);
-    let gemini_path = crate::hooks::gemini::get_gemini_settings_path()
-        .to_string_lossy()
-        .to_string();
-
-    let codex_installed = crate::hooks::codex::verify_codex_hooks_installed(false)
-        && crate::hooks::codex::codex_current_feature_enabled();
-    let codex_path = crate::hooks::codex::get_codex_config_path()
-        .to_string_lossy()
-        .to_string();
-
-    let opencode_installed = crate::hooks::opencode::verify_opencode_plugin_installed();
-    let opencode_path = crate::hooks::opencode::get_opencode_plugin_path()
-        .to_string_lossy()
-        .to_string();
-
-    let antigravity_installed =
-        crate::hooks::antigravity::verify_antigravity_hooks_installed(false);
-    let antigravity_path = crate::hooks::antigravity::get_antigravity_hooks_path()
-        .to_string_lossy()
-        .to_string();
-
-    vec![
-        ("claude", claude_installed, claude_path),
-        ("gemini", gemini_installed, gemini_path),
-        ("codex", codex_installed, codex_path),
-        ("opencode", opencode_installed, opencode_path),
-        ("antigravity", antigravity_installed, antigravity_path),
-    ]
+    HOOK_TOOLS
+        .iter()
+        .filter_map(|name| {
+            let tool = name.parse::<Tool>().ok()?;
+            Some((
+                *name,
+                tool.verify_hooks_installed(false),
+                tool.hooks_settings_path(),
+            ))
+        })
+        .collect()
 }
 
 /// Show hook installation status for all tools.
@@ -102,50 +85,18 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
     }
     let mut results: Vec<(&str, AddResult)> = Vec::new();
     for tool in &tools {
-        let already = match *tool {
-            "claude" => {
-                crate::hooks::claude::verify_claude_hooks_installed(None, include_permissions)
-            }
-            "gemini" => crate::hooks::gemini::verify_gemini_hooks_installed(include_permissions),
-            "codex" => {
-                crate::hooks::codex::verify_codex_hooks_installed(include_permissions)
-                    && crate::hooks::codex::codex_current_feature_enabled()
-            }
-            "opencode" => crate::hooks::opencode::verify_opencode_plugin_installed(),
-            "antigravity" => {
-                crate::hooks::antigravity::verify_antigravity_hooks_installed(include_permissions)
-            }
-            _ => false,
+        let Ok(parsed) = tool.parse::<Tool>() else {
+            results.push((tool, AddResult::Failed(None)));
+            continue;
         };
-        if already {
+        if parsed.verify_hooks_installed(include_permissions) {
             results.push((tool, AddResult::Already));
             continue;
         }
-        let outcome = match *tool {
-            "claude" => match crate::hooks::claude::try_setup_claude_hooks(include_permissions) {
-                Ok(()) => AddResult::Added,
-                Err(e) => AddResult::Failed(Some(e.to_string())),
-            },
-            "gemini" => match crate::hooks::gemini::try_setup_gemini_hooks(include_permissions) {
-                Ok(()) => AddResult::Added,
-                Err(e) => AddResult::Failed(Some(e.to_string())),
-            },
-            "codex" => match crate::hooks::codex::try_setup_codex_hooks(include_permissions) {
-                Ok(()) => AddResult::Added,
-                Err(e) => AddResult::Failed(Some(e.to_string())),
-            },
-            "opencode" => match crate::hooks::opencode::install_opencode_plugin() {
-                Ok(true) => AddResult::Added,
-                Ok(false) => AddResult::Failed(None),
-                Err(e) => AddResult::Failed(Some(e.to_string())),
-            },
-            "antigravity" => {
-                match crate::hooks::antigravity::try_setup_antigravity_hooks(include_permissions) {
-                    Ok(()) => AddResult::Added,
-                    Err(e) => AddResult::Failed(Some(e.to_string())),
-                }
-            }
-            _ => AddResult::Failed(None),
+        let outcome = match parsed.try_setup_hooks(include_permissions) {
+            Ok(()) => AddResult::Added,
+            Err(msg) if msg.is_empty() => AddResult::Failed(None),
+            Err(msg) => AddResult::Failed(Some(msg)),
         };
         results.push((tool, outcome));
     }
@@ -221,20 +172,14 @@ pub fn cmd_hooks_remove(argv: &[String]) -> i32 {
             .map(|(_, installed, _)| *installed)
             .unwrap_or(false);
 
-        let ok = match *tool {
-            "claude" => crate::hooks::claude::remove_claude_hooks(),
-            "gemini" => crate::hooks::gemini::remove_gemini_hooks(),
-            "codex" => crate::hooks::codex::remove_codex_hooks(),
-            "opencode" => match crate::hooks::opencode::remove_opencode_plugin() {
-                Ok(()) => true,
-                Err(e) => {
-                    eprintln!("Failed to remove {tool} hooks: {e}");
-                    fail_count += 1;
-                    continue;
-                }
-            },
-            "antigravity" => crate::hooks::antigravity::remove_antigravity_hooks(),
-            _ => false,
+        let ok = match tool.parse::<Tool>().map(|t| t.remove_hooks()) {
+            Ok(Ok(ok)) => ok,
+            Ok(Err(e)) => {
+                eprintln!("Failed to remove {tool} hooks: {e}");
+                fail_count += 1;
+                continue;
+            }
+            Err(_) => false,
         };
         if ok {
             if was_installed {

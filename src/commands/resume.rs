@@ -726,13 +726,16 @@ fn should_preview_resume(
 }
 
 fn validate_resume_operation(tool: &str, fork: bool) -> Result<()> {
-    if fork && tool == "gemini" {
-        bail!("Gemini does not support session forking (hcom f)");
+    if !fork {
+        return Ok(());
     }
-    if fork && tool == "antigravity" {
-        bail!(
-            "Antigravity does not support session forking (hcom f): agy exposes no fork primitive"
-        );
+    // Drive fork support from the spec so help text and validation can't drift.
+    // Accepts canonical names + aliases (e.g. `"agy"` → Antigravity).
+    if let Ok(parsed) = tool.parse::<crate::tool::Tool>() {
+        let spec = parsed.spec();
+        if spec.resume.and_then(|r| r.fork).is_none() {
+            bail!("{} does not support session forking (hcom f)", spec.label);
+        }
     }
     Ok(())
 }
@@ -929,36 +932,37 @@ fn load_stopped_snapshot(
     )
 }
 
-/// Build tool-specific resume/fork args.
+/// Build tool-specific resume/fork args from the integration spec.
 fn build_resume_args(tool: &str, session_id: &str, fork: bool) -> Vec<String> {
-    match tool {
-        "claude" | "claude-pty" => {
-            let mut args = vec!["--resume".to_string(), session_id.to_string()];
-            if fork {
-                args.push("--fork-session".to_string());
+    use crate::integration_spec::{ForkArgs, ResumeArgs};
+    // claude-pty resolves to the Claude spec.
+    let tool_lookup = if tool == "claude-pty" { "claude" } else { tool };
+    let Ok(tool_enum) = tool_lookup.parse::<crate::tool::Tool>() else {
+        return Vec::new();
+    };
+    let Some(resume_spec) = tool_enum.spec().resume.as_ref() else {
+        return Vec::new();
+    };
+
+    let mut args = match resume_spec.resume {
+        ResumeArgs::Flag(flag) => vec![flag.to_string(), session_id.to_string()],
+        ResumeArgs::Subcommand(sub) => vec![sub.to_string(), session_id.to_string()],
+    };
+
+    if fork {
+        match resume_spec.fork {
+            Some(ForkArgs::AppendFlag(flag)) => args.push(flag.to_string()),
+            Some(ForkArgs::Subcommand(sub)) => {
+                // Replace the resume subcommand with the fork subcommand.
+                if let Some(first) = args.first_mut() {
+                    *first = sub.to_string();
+                }
             }
-            args
+            None => {}
         }
-        "gemini" => {
-            vec!["--resume".to_string(), session_id.to_string()]
-        }
-        "codex" => {
-            let subcmd = if fork { "fork" } else { "resume" };
-            vec![subcmd.to_string(), session_id.to_string()]
-        }
-        "opencode" => {
-            let mut args = vec!["--session".to_string(), session_id.to_string()];
-            if fork {
-                args.push("--fork".to_string());
-            }
-            args
-        }
-        "antigravity" => {
-            // agy uses --conversation <id> to resume; fork has no CLI primitive.
-            vec!["--conversation".to_string(), session_id.to_string()]
-        }
-        _ => Vec::new(),
     }
+
+    args
 }
 
 /// Merge original launch args with resume-specific args.
@@ -1684,6 +1688,20 @@ mod tests {
     #[test]
     fn test_validate_resume_operation_allows_antigravity_resume() {
         assert!(validate_resume_operation("antigravity", false).is_ok());
+    }
+
+    #[test]
+    fn test_validate_resume_operation_rejects_agy_alias_fork() {
+        // The alias is launcher-canonicalised today, but fork validation must
+        // still reject `"agy"` so the rule lives on the spec, not on the DB
+        // shape.
+        let err = validate_resume_operation("agy", true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Antigravity") && err.contains("fork"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

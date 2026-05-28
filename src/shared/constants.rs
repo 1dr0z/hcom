@@ -47,11 +47,8 @@ pub fn extract_mentions(text: &str) -> Vec<String> {
 pub static BIND_MARKER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\[hcom:([a-z0-9_]+)\]").unwrap());
 
-/// Tools available for launch.
-pub const RELEASED_TOOLS: &[&str] = &["claude", "gemini", "codex", "opencode", "antigravity"];
-
-/// Tools that support background/headless mode.
-pub const RELEASED_BACKGROUND: &[&str] = &["claude"];
+// Released-tool lists moved to `crate::integration_spec` —
+// see `released_tool_names()` / `released_background_tool_names()`.
 
 /// Tool detection markers — set by AI tools, cleared to prevent inheritance.
 pub const TOOL_MARKER_VARS: &[&str] = &[
@@ -110,8 +107,7 @@ pub fn status_icon(status: &str) -> &'static str {
     }
 }
 
-/// Adhoc instance icon (neutral — not claiming alive or dead).
-pub const ADHOC_ICON: &str = "\u{25e6}"; // ◦
+// Adhoc instance icon lives on `IntegrationSpec.adhoc_icon` for Tool::Adhoc.
 
 /// Build the canonical pane-title label hcom writes into OSC 1/2 and pushes
 /// to host terminal label APIs (e.g. herdr's `pane.rename`).
@@ -214,16 +210,6 @@ mod tests {
         assert_eq!(status_icon(ST_LAUNCHING), "◎");
         assert_eq!(status_icon(ST_ERROR), "✗");
         assert_eq!(status_icon(ST_INACTIVE), "○");
-    }
-
-    #[test]
-    fn test_released_tools() {
-        assert!(RELEASED_TOOLS.contains(&"claude"));
-        assert!(RELEASED_TOOLS.contains(&"gemini"));
-        assert!(RELEASED_TOOLS.contains(&"codex"));
-        assert!(RELEASED_TOOLS.contains(&"opencode"));
-        assert!(RELEASED_TOOLS.contains(&"antigravity"));
-        assert_eq!(RELEASED_TOOLS.len(), 5);
     }
 
     #[test]

@@ -1331,6 +1331,37 @@ mod tests {
     }
 
     #[test]
+    fn detect_agent_type_covers_released_integration_specs() {
+        let cases = [
+            ("/home/user/.claude/projects/x/transcript.jsonl", "claude"),
+            ("/home/user/.gemini/tmp/session.json", "gemini"),
+            ("/home/user/.codex/sessions/x/rollout.jsonl", "codex"),
+            ("/home/user/.local/share/opencode/opencode.db", "opencode"),
+            (
+                "/home/user/Library/Application Support/Antigravity/session.jsonl",
+                "antigravity",
+            ),
+        ];
+        let expected: std::collections::HashSet<&str> =
+            crate::integration_spec::released_tool_names()
+                .into_iter()
+                .collect();
+        let actual: std::collections::HashSet<&str> = cases
+            .iter()
+            .map(|(path, expected_tool)| {
+                let detected = detect_agent_type(path);
+                assert_eq!(detected, *expected_tool);
+                detected
+            })
+            .collect();
+
+        assert_eq!(
+            actual, expected,
+            "transcript path detection cases must cover every released integration"
+        );
+    }
+
+    #[test]
     fn test_correlate_paths_to_hcom_uses_session_id_for_opencode() {
         let dir = tempfile::tempdir().unwrap();
         let db = HcomDb::open_raw(&dir.path().join("hcom.db")).unwrap();

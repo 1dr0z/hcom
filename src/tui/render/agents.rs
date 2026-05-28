@@ -68,8 +68,10 @@ fn append_right_aligned(left: &mut Vec<Span<'static>>, right: Vec<Span<'static>>
 fn agent_icon(agent: &Agent, tick: u64) -> &'static str {
     if agent.status == AgentStatus::Launching {
         SPINNER_FRAMES[(tick as usize / 2) % SPINNER_FRAMES.len()]
-    } else if agent.tool == Tool::Adhoc && agent.status != AgentStatus::Listening {
-        "\u{25E6}" // ◦ neutral dot for adhoc
+    } else if agent.status != AgentStatus::Listening
+        && let Some(icon) = agent.tool.spec().adhoc_icon
+    {
+        icon
     } else {
         agent.status.icon()
     }
@@ -77,14 +79,7 @@ fn agent_icon(agent: &Agent, tick: u64) -> &'static str {
 
 /// 4-char tool prefix for multi-tool display.
 fn tool_prefix_str(tool: Tool) -> &'static str {
-    match tool {
-        Tool::Claude => "cla ",
-        Tool::Gemini => "gem ",
-        Tool::Codex => "cod ",
-        Tool::OpenCode => "opc ",
-        Tool::Antigravity => "agy ",
-        Tool::Adhoc => "ah  ",
-    }
+    tool.spec().tui_prefix
 }
 
 fn collect_agent_lines(app: &App, width: u16, max_visible: usize) -> Vec<Line<'static>> {

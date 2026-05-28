@@ -29,7 +29,10 @@ pub fn run(argv: &[String], flags: &GlobalFlags) -> Result<i32> {
     if count == 0 {
         bail!("Count must be positive.");
     }
-    let max_count: usize = if tool == "claude" { 100 } else { 10 };
+    let max_count: usize = tool
+        .parse::<crate::tool::Tool>()
+        .map(|t| t.spec().launch.max_launch_count)
+        .unwrap_or(10);
     if count > max_count {
         bail!("Too many agents requested (max {}).", max_count);
     }
@@ -419,13 +422,19 @@ pub(crate) fn print_launch_preview(preview: LaunchPreview<'_>) {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".to_string())
     });
-    let args_key = format!("HCOM_{}_ARGS", preview.tool.to_uppercase());
+    // Drive the args-env label from the spec so we never invent a key (e.g.
+    // `HCOM_ANTIGRAVITY_ARGS`) for tools that don't have one.
+    let args_key: Option<&'static str> = preview
+        .tool
+        .parse::<crate::tool::Tool>()
+        .ok()
+        .and_then(|t| t.spec().launch.args_env);
     let env_args = if preview.show_config_args {
         match preview.tool {
-            "claude" => &preview.config.claude_args,
-            "gemini" => &preview.config.gemini_args,
-            "codex" => &preview.config.codex_args,
-            "opencode" => &preview.config.opencode_args,
+            "claude" => preview.config.claude_args.as_str(),
+            "gemini" => preview.config.gemini_args.as_str(),
+            "codex" => preview.config.codex_args.as_str(),
+            "opencode" => preview.config.opencode_args.as_str(),
             _ => "",
         }
     } else {
@@ -458,7 +467,10 @@ pub(crate) fn print_launch_preview(preview: LaunchPreview<'_>) {
     if !env_args.is_empty() || !preview.args.is_empty() {
         println!("\nArgs:");
         if !env_args.is_empty() {
-            println!("  From config ({}): {}", args_key, env_args);
+            match args_key {
+                Some(key) => println!("  From config ({}): {}", key, env_args),
+                None => println!("  From config: {}", env_args),
+            }
         }
         if !preview.args.is_empty() {
             println!("  From CLI: {}", preview.args.join(" "));

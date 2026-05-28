@@ -59,20 +59,43 @@ impl LaunchTool {
         }
     }
 
-    /// Base tool name (without -pty suffix).
-    pub fn base_tool(&self) -> &'static str {
+    /// Canonical [`Tool`] for this launch surface.
+    ///
+    /// `ClaudePty` is a launch-surface alias (PTY-wrapped Claude); it resolves
+    /// to `Tool::Claude` so all per-tool data flows through one spec.
+    pub fn tool(&self) -> crate::tool::Tool {
         match self {
-            LaunchTool::Claude | LaunchTool::ClaudePty => "claude",
-            LaunchTool::Gemini => "gemini",
-            LaunchTool::Codex => "codex",
-            LaunchTool::OpenCode => "opencode",
-            LaunchTool::Antigravity => "antigravity",
+            LaunchTool::Claude | LaunchTool::ClaudePty => crate::tool::Tool::Claude,
+            LaunchTool::Gemini => crate::tool::Tool::Gemini,
+            LaunchTool::Codex => crate::tool::Tool::Codex,
+            LaunchTool::OpenCode => crate::tool::Tool::OpenCode,
+            LaunchTool::Antigravity => crate::tool::Tool::Antigravity,
         }
+    }
+
+    /// Integration spec for this launch surface (shared with the base `Tool`).
+    pub fn spec(&self) -> &'static crate::integration_spec::IntegrationSpec {
+        self.tool().spec()
+    }
+
+    /// Base tool name (without -pty suffix). Equivalent to `self.tool().as_str()`.
+    pub fn base_tool(&self) -> &'static str {
+        self.tool().as_str()
     }
 
     /// Whether this tool uses the PTY wrapper.
     pub fn uses_pty(&self) -> bool {
-        !matches!(self, LaunchTool::Claude)
+        // ClaudePty is a launch surface (alias), not a Tool variant — it always
+        // takes the PTY path. Everything else defers to the canonical spec.
+        if matches!(self, LaunchTool::ClaudePty) {
+            return true;
+        }
+        self.spec().launch.uses_pty_default
+    }
+
+    /// Executable name on PATH for this tool.
+    pub fn cli_binary(&self) -> &'static str {
+        self.spec().cli_binary
     }
 }
 
@@ -280,12 +303,7 @@ fn install_diag_context(tool: &LaunchTool, paths: &[(&str, std::path::PathBuf)])
         "  HCOM_DIR={}",
         std::env::var("HCOM_DIR").unwrap_or_else(|_| "<unset>".into())
     );
-    let tool_env_var = match tool {
-        LaunchTool::Claude | LaunchTool::ClaudePty => Some("CLAUDE_CONFIG_DIR"),
-        LaunchTool::Gemini | LaunchTool::Antigravity => Some("GEMINI_CLI_HOME"),
-        LaunchTool::Codex => Some("CODEX_HOME"),
-        LaunchTool::OpenCode => None,
-    };
+    let tool_env_var = tool.spec().launch.config_dir_env;
     if let Some(env_var) = tool_env_var {
         let _ = writeln!(
             out,
@@ -508,7 +526,10 @@ pub fn create_runner_script(
         path_dirs.push(dir.to_string_lossy().into_owned());
     }
 
-    let tool_bin = if tool == "antigravity" { "agy" } else { tool };
+    let tool_bin = tool
+        .parse::<crate::tool::Tool>()
+        .map(|t| t.spec().cli_binary)
+        .unwrap_or(tool);
     for bin_name in &[tool_bin, "hcom", "python3", "node"] {
         if let Some(bin_path) = terminal::which_bin(bin_name)
             && let Some(dir) = Path::new(&bin_path).parent()
@@ -943,29 +964,17 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                 String::new()
             };
         let full_prompt = format!("{prompt}{reply_suffix}");
-        match normalized {
-            LaunchTool::Claude | LaunchTool::ClaudePty => {
-                // Claude: positional argument (after --)
+        // Per-tool shape lives in the integration spec.
+        match normalized.spec().launch.initial_prompt {
+            crate::integration_spec::InitialPromptShape::DashDashPositional => {
                 params.args.push("--".to_string());
                 params.args.push(full_prompt);
             }
-            LaunchTool::Gemini => {
-                // Gemini: positional arg = interactive mode (--prompt would make it headless)
+            crate::integration_spec::InitialPromptShape::Positional => {
                 params.args.push(full_prompt);
             }
-            LaunchTool::Codex => {
-                // Codex: positional argument
-                params.args.push(full_prompt);
-            }
-            LaunchTool::OpenCode => {
-                // OpenCode: --prompt flag
-                params.args.push("--prompt".to_string());
-                params.args.push(full_prompt);
-            }
-            LaunchTool::Antigravity => {
-                // Antigravity: --prompt-interactive for interactive sessions
-                // (bare positional is not documented; agy --help shows -i/--prompt-interactive)
-                params.args.push("--prompt-interactive".to_string());
+            crate::integration_spec::InitialPromptShape::Flag(flag) => {
+                params.args.push(flag.to_string());
                 params.args.push(full_prompt);
             }
         }
@@ -1095,13 +1104,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         }
 
         // Check tool binary exists before launching
-        let tool_binary = match normalized {
-            LaunchTool::Claude | LaunchTool::ClaudePty => "claude",
-            LaunchTool::Gemini => "gemini",
-            LaunchTool::Codex => "codex",
-            LaunchTool::OpenCode => "opencode",
-            LaunchTool::Antigravity => "agy",
-        };
+        let tool_binary = normalized.cli_binary();
         if !is_tool_installed(tool_binary) {
             eprintln!("Error: '{}' is not installed or not in PATH", tool_binary);
             errors.push(

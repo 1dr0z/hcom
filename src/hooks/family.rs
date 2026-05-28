@@ -2,94 +2,45 @@
 //!
 //! and tool-specific settings module patterns.
 
-use std::collections::HashMap;
-use std::sync::LazyLock;
-
 use crate::db::HcomDb;
 use crate::instances;
 use crate::log;
-
-/// Map tool categories to specific tool names, per AI tool.
-///
-/// Used by extract_tool_detail() to determine what detail to show
-/// in status display for each tool invocation.
-///
-pub static TOOL_NAME_MAPPINGS: LazyLock<
-    HashMap<&'static str, HashMap<&'static str, Vec<&'static str>>>,
-> = LazyLock::new(|| {
-    let mut m = HashMap::new();
-
-    let mut claude = HashMap::new();
-    claude.insert("bash", vec!["Bash"]);
-    claude.insert("file", vec!["Write", "Edit"]);
-    claude.insert("delegate", vec!["Task", "Agent"]);
-    m.insert("claude", claude);
-
-    let mut gemini = HashMap::new();
-    gemini.insert("bash", vec!["run_shell_command"]);
-    gemini.insert("file", vec!["write_file", "replace"]);
-    gemini.insert("delegate", vec!["delegate_to_agent"]);
-    m.insert("gemini", gemini);
-
-    let mut codex = HashMap::new();
-    codex.insert(
-        "bash",
-        vec!["Bash", "execute_command", "shell", "shell_command"],
-    );
-    codex.insert("file", vec!["apply_patch"]);
-    m.insert("codex", codex);
-
-    let mut antigravity = HashMap::new();
-    antigravity.insert("bash", vec!["run_command"]);
-    antigravity.insert(
-        "file",
-        vec![
-            "write_to_file",
-            "replace_file_content",
-            "multi_replace_file_content",
-        ],
-    );
-    antigravity.insert("delegate", vec!["invoke_subagent"]);
-    m.insert("antigravity", antigravity);
-
-    m
-});
+use crate::tool::Tool;
 
 /// Extract human-readable detail from tool input for status display.
 ///
-/// Centralizes tool detail extraction across claude/gemini/codex hooks.
+/// Reads per-tool tool-name categories from `IntegrationSpec.status_detail`.
 /// Returns the relevant field (command for bash, file_path for file ops,
 /// prompt for delegate) or empty string if tool not recognized.
-///
 pub fn extract_tool_detail(tool: &str, tool_name: &str, tool_input: &serde_json::Value) -> String {
-    let Some(mappings) = TOOL_NAME_MAPPINGS.get(tool) else {
+    let Ok(tool_enum) = tool.parse::<Tool>() else {
         return String::new();
     };
+    let detail = &tool_enum.spec().status_detail;
 
-    for (category, tool_names) in mappings {
-        if tool_names.contains(&tool_name) {
-            return match *category {
-                "bash" => tool_input
-                    .get("command")
-                    .or_else(|| tool_input.get("CommandLine"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                "file" => tool_input
-                    .get("file_path")
-                    .or_else(|| tool_input.get("TargetFile"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                "delegate" => tool_input
-                    .get("prompt")
-                    .or_else(|| tool_input.get("task"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                _ => String::new(),
-            };
-        }
+    if detail.bash.contains(&tool_name) {
+        return tool_input
+            .get("command")
+            .or_else(|| tool_input.get("CommandLine"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+    }
+    if detail.file.contains(&tool_name) {
+        return tool_input
+            .get("file_path")
+            .or_else(|| tool_input.get("TargetFile"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+    }
+    if detail.delegate.contains(&tool_name) {
+        return tool_input
+            .get("prompt")
+            .or_else(|| tool_input.get("task"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
     }
 
     String::new()
@@ -155,39 +106,43 @@ pub fn bind_vanilla_instance(
 mod tests {
     use super::*;
 
+    fn spec_for(tool: &str) -> &'static crate::integration_spec::StatusDetailSpec {
+        &tool.parse::<Tool>().unwrap().spec().status_detail
+    }
+
     #[test]
     fn test_tool_name_mappings_claude() {
-        let mappings = TOOL_NAME_MAPPINGS.get("claude").unwrap();
-        assert!(mappings["bash"].contains(&"Bash"));
-        assert!(mappings["file"].contains(&"Write"));
-        assert!(mappings["file"].contains(&"Edit"));
-        assert!(mappings["delegate"].contains(&"Task"));
+        let d = spec_for("claude");
+        assert!(d.bash.contains(&"Bash"));
+        assert!(d.file.contains(&"Write"));
+        assert!(d.file.contains(&"Edit"));
+        assert!(d.delegate.contains(&"Task"));
     }
 
     #[test]
     fn test_tool_name_mappings_gemini() {
-        let mappings = TOOL_NAME_MAPPINGS.get("gemini").unwrap();
-        assert!(mappings["bash"].contains(&"run_shell_command"));
-        assert!(mappings["file"].contains(&"write_file"));
-        assert!(mappings["delegate"].contains(&"delegate_to_agent"));
+        let d = spec_for("gemini");
+        assert!(d.bash.contains(&"run_shell_command"));
+        assert!(d.file.contains(&"write_file"));
+        assert!(d.delegate.contains(&"delegate_to_agent"));
     }
 
     #[test]
     fn test_tool_name_mappings_codex() {
-        let mappings = TOOL_NAME_MAPPINGS.get("codex").unwrap();
-        assert!(mappings["bash"].contains(&"execute_command"));
-        assert!(mappings["file"].contains(&"apply_patch"));
-        assert!(!mappings.contains_key("delegate"));
+        let d = spec_for("codex");
+        assert!(d.bash.contains(&"execute_command"));
+        assert!(d.file.contains(&"apply_patch"));
+        assert!(d.delegate.is_empty());
     }
 
     #[test]
     fn test_tool_name_mappings_antigravity() {
-        let mappings = TOOL_NAME_MAPPINGS.get("antigravity").unwrap();
-        assert!(mappings["bash"].contains(&"run_command"));
-        assert!(mappings["file"].contains(&"write_to_file"));
-        assert!(mappings["file"].contains(&"replace_file_content"));
-        assert!(mappings["file"].contains(&"multi_replace_file_content"));
-        assert!(mappings["delegate"].contains(&"invoke_subagent"));
+        let d = spec_for("antigravity");
+        assert!(d.bash.contains(&"run_command"));
+        assert!(d.file.contains(&"write_to_file"));
+        assert!(d.file.contains(&"replace_file_content"));
+        assert!(d.file.contains(&"multi_replace_file_content"));
+        assert!(d.delegate.contains(&"invoke_subagent"));
     }
 
     #[test]

@@ -1,0 +1,991 @@
+//! Unified per-tool integration registry.
+//!
+//! One `IntegrationSpec` constant per [`Tool`](crate::tool::Tool) variant holds
+//! the per-tool facts previously scattered across `tool.rs`, `delivery.rs`,
+//! `commands/help.rs`, `hooks/family.rs`, `tui/render/agents.rs`, `launcher.rs`,
+//! `commands/launch.rs`, and `commands/resume.rs`.
+//!
+//! The spec is the configuration plane, not "one file to add a tool" (although that would clearly be better if possible):
+//! behavioral integration (hook handler bodies, binding, delivery injection,
+//! preprocessing, plugins, arg parsers) still lives in dedicated modules.
+//!
+//! Not included on purpose:
+//! - `HOOK_REGISTRY` (Claude-only; lives in `hooks/utils.rs` as its own
+//!   registry — already a single source of truth, no drift across tools).
+//! - `TOOL_MARKER_VARS` (flat list; current callers want the union, not the
+//!   per-tool grouping).
+//! - Transcript parser dispatch (already abstracted by `transcript::ToolKind`).
+//! - System-prompt env var keys (typed fields on `HcomConfig`; lookup goes
+//!   through `config.rs::FIELD_TO_ENV`).
+
+use crate::tool::Tool;
+
+/// Help entry: `(usage, description)`. Mirrors `commands/help.rs::HelpEntry`.
+pub type HelpEntry = (&'static str, &'static str);
+
+/// How the external tool invokes hcom hook commands.
+///
+/// This is descriptive metadata for compatibility/spec auditing. Runtime hook
+/// dispatch is driven by hook command names and per-tool handlers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookInvocation {
+    /// JSON payload on stdin (Claude, Gemini, Codex, Antigravity).
+    JsonStdin,
+    /// argv-style subcommand (OpenCode).
+    Argv,
+    /// No hooks (Adhoc).
+    None,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HooksSpec {
+    /// Hook command names this tool answers to (e.g. `["poll", "post", …]`).
+    pub names: &'static [&'static str],
+    /// If set, this tool borrows another tool's hook command names. Routing
+    /// should resolve those names to the owner, not the borrowing tool.
+    ///
+    /// Antigravity borrows Gemini hook names and is identified out-of-band by
+    /// `ANTIGRAVITY_AGENT`, so `Tool::Antigravity.owns_hook("gemini-*")` must
+    /// stay false even though this spec lists Gemini's hook names.
+    pub shared_hooks_with: Option<Tool>,
+    pub invocation: HookInvocation,
+}
+
+/// PTY delivery gate booleans. Mirrors fields on `delivery::ToolConfig`.
+#[derive(Debug, Clone, Copy)]
+pub struct GatesSpec {
+    pub require_idle: bool,
+    pub require_ready_prompt: bool,
+    pub require_prompt_empty: bool,
+    pub block_on_user_activity: bool,
+    pub block_on_approval: bool,
+    pub launch_requires_ready: bool,
+}
+
+/// Tool background-launch capability.
+///
+/// Captures the spectrum currently expressed by `released_background: bool` and
+/// the dispatch table in [`LaunchBackend::resolve`]. Used to:
+///
+/// - Drive `released_background_tool_names()` (filters for `NativePrint`).
+/// - Document, in one place, how each tool behaves when `--headless` is set.
+/// - Provide a typed gate for adding future tools: a new spec must pick a
+///   variant rather than implicitly defaulting to "no background".
+///
+/// Variants:
+/// - `Unsupported`: tool has no background launch path. Currently only Adhoc.
+/// - `HeadlessPty`: background is routed through the PTY wrapper in a detached
+///   runner; the live TUI keeps running there. gemini, codex, opencode, agy.
+/// - `NativePrint`: background launches a detached one-shot in the tool's own
+///   print mode (Claude `-p --output-format stream-json --verbose`).
+///   `--pty --headless` still routes through `HeadlessPty`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundMode {
+    Unsupported,
+    HeadlessPty,
+    NativePrint,
+}
+
+/// How `--hcom-prompt` becomes tool-side CLI args.
+#[derive(Debug, Clone, Copy)]
+pub enum InitialPromptShape {
+    /// `claude` — `--` then positional.
+    DashDashPositional,
+    /// `gemini`, `codex` — bare positional (interactive).
+    Positional,
+    /// `opencode --prompt <text>`, `agy --prompt-interactive <text>`.
+    Flag(&'static str),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LaunchSpec {
+    /// Env var holding default CLI args (e.g. `HCOM_CLAUDE_ARGS`).
+    pub args_env: Option<&'static str>,
+    /// Env var holding the tool's config directory (e.g. `CLAUDE_CONFIG_DIR`).
+    pub config_dir_env: Option<&'static str>,
+    pub initial_prompt: InitialPromptShape,
+    /// PTY-by-default. `false` only for `claude` (which has a `claude-pty`
+    /// alias for the PTY path).
+    pub uses_pty_default: bool,
+    /// Max agents per `hcom [N] <tool>` invocation. Claude gets a larger budget
+    /// because of background bulk-launch (`-p` mode); others are capped at 10.
+    pub max_launch_count: usize,
+    /// Background-launch capability (see [`BackgroundMode`]).
+    pub background: BackgroundMode,
+}
+
+/// Per-tool resume argument shape.
+#[derive(Debug, Clone, Copy)]
+pub enum ResumeArgs {
+    /// `--resume <id>`, `--session <id>`, `--conversation <id>`.
+    Flag(&'static str),
+    /// `resume <id>` (Codex subcommand).
+    Subcommand(&'static str),
+}
+
+/// Per-tool fork argument shape.
+#[derive(Debug, Clone, Copy)]
+pub enum ForkArgs {
+    /// Resume + append flag (claude `--fork-session`, opencode `--fork`).
+    AppendFlag(&'static str),
+    /// Fork is a sibling subcommand (Codex `fork <id>`).
+    Subcommand(&'static str),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ResumeSpec {
+    pub resume: ResumeArgs,
+    pub fork: Option<ForkArgs>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HelpSpec {
+    pub unique_examples: &'static [HelpEntry],
+    pub extra_env: &'static [HelpEntry],
+}
+
+/// Tool-input field mappings used by `extract_tool_detail` for status display.
+/// Each category lists the per-tool tool-call names that produce that kind of
+/// activity (bash command, file write, subagent delegate).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StatusDetailSpec {
+    pub bash: &'static [&'static str],
+    pub file: &'static [&'static str],
+    pub delegate: &'static [&'static str],
+}
+
+/// Complete per-tool integration data.
+pub struct IntegrationSpec {
+    pub tool: Tool,
+    pub name: &'static str,
+    pub label: &'static str,
+    /// CLI aliases beyond `name` (e.g. `["agy"]` for Antigravity).
+    pub aliases: &'static [&'static str],
+    /// Executable name on PATH. Usually matches `name`; differs for Antigravity
+    /// (`agy`).
+    pub cli_binary: &'static str,
+    /// 4-char TUI prefix shown in multi-tool agent lists.
+    pub tui_prefix: &'static str,
+    /// Static icon used when agent status doesn't drive the glyph (Adhoc only).
+    pub adhoc_icon: Option<&'static str>,
+    /// True if this tool is in the public `RELEASED_TOOLS` set.
+    pub released: bool,
+    /// PTY ready-pattern bytes (empty for Adhoc).
+    pub ready_pattern: &'static [u8],
+
+    pub hooks: HooksSpec,
+    pub gates: GatesSpec,
+    pub launch: LaunchSpec,
+    pub resume: Option<ResumeSpec>,
+    pub help: HelpSpec,
+    pub status_detail: StatusDetailSpec,
+}
+
+// ── Hook command name tables ────────────────────────────────────────────
+
+const CLAUDE_HOOKS: &[&str] = &[
+    "poll",
+    "notify",
+    "permission-request",
+    "pre",
+    "post",
+    "sessionstart",
+    "userpromptsubmit",
+    "sessionend",
+    "subagent-start",
+    "subagent-stop",
+];
+
+const GEMINI_HOOKS: &[&str] = &[
+    "gemini-sessionstart",
+    "gemini-beforeagent",
+    "gemini-afteragent",
+    "gemini-beforetool",
+    "gemini-aftertool",
+    "gemini-notification",
+    "gemini-sessionend",
+];
+
+const CODEX_HOOKS: &[&str] = &[
+    "codex-sessionstart",
+    "codex-userpromptsubmit",
+    "codex-pretooluse",
+    "codex-posttooluse",
+    "codex-stop",
+];
+
+const OPENCODE_HOOKS: &[&str] = &[
+    "opencode-start",
+    "opencode-status",
+    "opencode-read",
+    "opencode-stop",
+];
+
+// ── Help examples / extra-env tables ────────────────────────────────────
+
+const CLAUDE_HELP_EXAMPLES: &[HelpEntry] = &[
+    ("hcom 1 claude --agent <name>", ".claude/agents/<name>.md"),
+    (
+        "hcom claude --model sonnet|opus|haiku",
+        "Use a specific model",
+    ),
+];
+const CLAUDE_HELP_EXTRA_ENV: &[HelpEntry] = &[(
+    "HCOM_SUBAGENT_TIMEOUT",
+    "Seconds subagents keep-alive after task",
+)];
+
+const GEMINI_HELP_EXAMPLES: &[HelpEntry] = &[
+    ("hcom N gemini --yolo", "Flags forwarded to gemini"),
+    (
+        "hcom gemini --model gemini-3.1-pro-preview|gemini-2.5-flash",
+        "Use a specific model",
+    ),
+];
+const GEMINI_HELP_EXTRA_ENV: &[HelpEntry] =
+    &[("HCOM_GEMINI_SYSTEM_PROMPT", "System prompt (env var)")];
+
+const CODEX_HELP_EXAMPLES: &[HelpEntry] = &[
+    (
+        "hcom codex --sandbox danger-full-access",
+        "Flags forwarded to codex",
+    ),
+    (
+        "hcom codex --model gpt-5.4|gpt-5.4-mini",
+        "Use a specific model",
+    ),
+];
+const CODEX_HELP_EXTRA_ENV: &[HelpEntry] = &[
+    (
+        "HCOM_CODEX_SYSTEM_PROMPT",
+        "System prompt (env var or config)",
+    ),
+    (
+        "HCOM_CODEX_SANDBOX_MODE",
+        "workspace | untrusted | danger-full-access | none",
+    ),
+];
+
+const OPENCODE_HELP_EXAMPLES: &[HelpEntry] = &[(
+    "hcom opencode --model anthropic/claude-sonnet-4-6|openai/gpt-5.4",
+    "Use a specific model",
+)];
+
+const AGY_HELP_EXAMPLES: &[HelpEntry] = &[
+    ("hcom antigravity", "Long-form alias"),
+    ("hcom agy --sandbox", "Flags forwarded to agy"),
+    ("hcom r <name>", "Resume a stopped agy session"),
+];
+
+// ── Per-tool integration constants ──────────────────────────────────────
+
+pub static CLAUDE: IntegrationSpec = IntegrationSpec {
+    tool: Tool::Claude,
+    name: "claude",
+    label: "Claude",
+    aliases: &[],
+    cli_binary: "claude",
+    tui_prefix: "cla ",
+    adhoc_icon: None,
+    released: true,
+    ready_pattern: b"? for shortcuts",
+    hooks: HooksSpec {
+        names: CLAUDE_HOOKS,
+        shared_hooks_with: None,
+        invocation: HookInvocation::JsonStdin,
+    },
+    // - require_ready_prompt=false: status bar hides in accept-edits mode.
+    // - require_prompt_empty=true: VT100 dim detection separates placeholder
+    //   (dim) from user input (not dim).
+    gates: GatesSpec {
+        require_idle: true,
+        require_ready_prompt: false,
+        require_prompt_empty: true,
+        block_on_user_activity: true,
+        block_on_approval: true,
+        launch_requires_ready: false,
+    },
+    launch: LaunchSpec {
+        args_env: Some("HCOM_CLAUDE_ARGS"),
+        config_dir_env: Some("CLAUDE_CONFIG_DIR"),
+        initial_prompt: InitialPromptShape::DashDashPositional,
+        uses_pty_default: false,
+        max_launch_count: 100,
+        background: BackgroundMode::NativePrint,
+    },
+    resume: Some(ResumeSpec {
+        resume: ResumeArgs::Flag("--resume"),
+        fork: Some(ForkArgs::AppendFlag("--fork-session")),
+    }),
+    help: HelpSpec {
+        unique_examples: CLAUDE_HELP_EXAMPLES,
+        extra_env: CLAUDE_HELP_EXTRA_ENV,
+    },
+    status_detail: StatusDetailSpec {
+        bash: &["Bash"],
+        file: &["Write", "Edit"],
+        delegate: &["Task", "Agent"],
+    },
+};
+
+pub static GEMINI: IntegrationSpec = IntegrationSpec {
+    tool: Tool::Gemini,
+    name: "gemini",
+    label: "Gemini",
+    aliases: &[],
+    cli_binary: "gemini",
+    tui_prefix: "gem ",
+    adhoc_icon: None,
+    released: true,
+    ready_pattern: b"Type your message",
+    hooks: HooksSpec {
+        names: GEMINI_HOOKS,
+        shared_hooks_with: None,
+        invocation: HookInvocation::JsonStdin,
+    },
+    // require_ready_prompt=true: "Type your message" placeholder disappears
+    // instantly when user types, so visibility implies an empty prompt.
+    gates: GatesSpec {
+        require_idle: true,
+        require_ready_prompt: true,
+        require_prompt_empty: false,
+        block_on_user_activity: true,
+        block_on_approval: true,
+        launch_requires_ready: true,
+    },
+    launch: LaunchSpec {
+        args_env: Some("HCOM_GEMINI_ARGS"),
+        config_dir_env: Some("GEMINI_CLI_HOME"),
+        initial_prompt: InitialPromptShape::Positional,
+        uses_pty_default: true,
+        max_launch_count: 10,
+        background: BackgroundMode::HeadlessPty,
+    },
+    resume: Some(ResumeSpec {
+        resume: ResumeArgs::Flag("--resume"),
+        fork: None,
+    }),
+    help: HelpSpec {
+        unique_examples: GEMINI_HELP_EXAMPLES,
+        extra_env: GEMINI_HELP_EXTRA_ENV,
+    },
+    status_detail: StatusDetailSpec {
+        bash: &["run_shell_command"],
+        file: &["write_file", "replace"],
+        delegate: &["delegate_to_agent"],
+    },
+};
+
+pub static CODEX: IntegrationSpec = IntegrationSpec {
+    tool: Tool::Codex,
+    name: "codex",
+    label: "Codex",
+    aliases: &[],
+    cli_binary: "codex",
+    tui_prefix: "cod ",
+    adhoc_icon: None,
+    released: true,
+    ready_pattern: "\u{203A} ".as_bytes(),
+    hooks: HooksSpec {
+        names: CODEX_HOOKS,
+        shared_hooks_with: None,
+        invocation: HookInvocation::JsonStdin,
+    },
+    // - require_ready_prompt=false: "? for shortcuts" hides in narrow terminals.
+    // - require_prompt_empty=true: VT100 dim detection on the `›` prompt char.
+    gates: GatesSpec {
+        require_idle: true,
+        require_ready_prompt: false,
+        require_prompt_empty: true,
+        block_on_user_activity: true,
+        block_on_approval: true,
+        launch_requires_ready: false,
+    },
+    launch: LaunchSpec {
+        args_env: Some("HCOM_CODEX_ARGS"),
+        config_dir_env: Some("CODEX_HOME"),
+        initial_prompt: InitialPromptShape::Positional,
+        uses_pty_default: true,
+        max_launch_count: 10,
+        background: BackgroundMode::HeadlessPty,
+    },
+    resume: Some(ResumeSpec {
+        resume: ResumeArgs::Subcommand("resume"),
+        fork: Some(ForkArgs::Subcommand("fork")),
+    }),
+    help: HelpSpec {
+        unique_examples: CODEX_HELP_EXAMPLES,
+        extra_env: CODEX_HELP_EXTRA_ENV,
+    },
+    status_detail: StatusDetailSpec {
+        bash: &["Bash", "execute_command", "shell", "shell_command"],
+        file: &["apply_patch"],
+        delegate: &[],
+    },
+};
+
+pub static OPENCODE: IntegrationSpec = IntegrationSpec {
+    tool: Tool::OpenCode,
+    name: "opencode",
+    label: "OpenCode",
+    aliases: &[],
+    cli_binary: "opencode",
+    tui_prefix: "opc ",
+    adhoc_icon: None,
+    released: true,
+    ready_pattern: b"ctrl+p commands",
+    hooks: HooksSpec {
+        names: OPENCODE_HOOKS,
+        shared_hooks_with: None,
+        invocation: HookInvocation::Argv,
+    },
+    // Runtime gates off — the TypeScript plugin owns delivery after bootstrap.
+    // launch_requires_ready=true so PTY bootstrap inject lands on a usable TUI.
+    gates: GatesSpec {
+        require_idle: false,
+        require_ready_prompt: false,
+        require_prompt_empty: false,
+        block_on_user_activity: false,
+        block_on_approval: false,
+        launch_requires_ready: true,
+    },
+    launch: LaunchSpec {
+        args_env: Some("HCOM_OPENCODE_ARGS"),
+        config_dir_env: None,
+        initial_prompt: InitialPromptShape::Flag("--prompt"),
+        uses_pty_default: true,
+        max_launch_count: 10,
+        background: BackgroundMode::HeadlessPty,
+    },
+    resume: Some(ResumeSpec {
+        resume: ResumeArgs::Flag("--session"),
+        fork: Some(ForkArgs::AppendFlag("--fork")),
+    }),
+    help: HelpSpec {
+        unique_examples: OPENCODE_HELP_EXAMPLES,
+        extra_env: &[],
+    },
+    status_detail: StatusDetailSpec {
+        bash: &[],
+        file: &[],
+        delegate: &[],
+    },
+};
+
+pub static ANTIGRAVITY: IntegrationSpec = IntegrationSpec {
+    tool: Tool::Antigravity,
+    name: "antigravity",
+    label: "Antigravity",
+    aliases: &["agy"],
+    cli_binary: "agy",
+    tui_prefix: "agy ",
+    adhoc_icon: None,
+    released: true,
+    ready_pattern: b"? for shortcuts",
+    hooks: HooksSpec {
+        names: GEMINI_HOOKS,
+        // Antigravity reuses Gemini hook names; routing resolves those names
+        // to Gemini. Identity is established via ANTIGRAVITY_AGENT.
+        shared_hooks_with: Some(Tool::Gemini),
+        invocation: HookInvocation::JsonStdin,
+    },
+    gates: GatesSpec {
+        require_idle: true,
+        require_ready_prompt: true,
+        require_prompt_empty: true,
+        block_on_user_activity: false,
+        block_on_approval: true,
+        launch_requires_ready: true,
+    },
+    launch: LaunchSpec {
+        args_env: None,
+        // Antigravity shares Gemini's config tree.
+        config_dir_env: Some("GEMINI_CLI_HOME"),
+        initial_prompt: InitialPromptShape::Flag("--prompt-interactive"),
+        uses_pty_default: true,
+        max_launch_count: 10,
+        background: BackgroundMode::HeadlessPty,
+    },
+    resume: Some(ResumeSpec {
+        resume: ResumeArgs::Flag("--conversation"),
+        fork: None,
+    }),
+    help: HelpSpec {
+        // Help lookup uses "agy" externally; the agy unique examples document
+        // the long-form alias as a forwarded flag.
+        unique_examples: AGY_HELP_EXAMPLES,
+        extra_env: &[],
+    },
+    status_detail: StatusDetailSpec {
+        bash: &["run_command"],
+        file: &[
+            "write_to_file",
+            "replace_file_content",
+            "multi_replace_file_content",
+        ],
+        delegate: &["invoke_subagent"],
+    },
+};
+
+pub static ADHOC: IntegrationSpec = IntegrationSpec {
+    tool: Tool::Adhoc,
+    name: "adhoc",
+    label: "Adhoc",
+    aliases: &[],
+    cli_binary: "",
+    tui_prefix: "ah  ",
+    adhoc_icon: Some("\u{25e6}"), // ◦ neutral dot
+    released: false,
+    ready_pattern: b"",
+    hooks: HooksSpec {
+        names: &[],
+        shared_hooks_with: None,
+        invocation: HookInvocation::None,
+    },
+    // Adhoc inherits Claude gates — delivery is manual via `hcom listen` /
+    // hookless CLI unread, so the values are documented but mostly unused.
+    gates: GatesSpec {
+        require_idle: true,
+        require_ready_prompt: false,
+        require_prompt_empty: true,
+        block_on_user_activity: true,
+        block_on_approval: true,
+        launch_requires_ready: false,
+    },
+    launch: LaunchSpec {
+        args_env: None,
+        config_dir_env: None,
+        initial_prompt: InitialPromptShape::Positional,
+        uses_pty_default: false,
+        max_launch_count: 0,
+        background: BackgroundMode::Unsupported,
+    },
+    resume: None,
+    help: HelpSpec {
+        unique_examples: &[],
+        extra_env: &[],
+    },
+    status_detail: StatusDetailSpec {
+        bash: &[],
+        file: &[],
+        delegate: &[],
+    },
+};
+
+/// All specs in canonical order. `Tool::spec` indexes into this implicitly via
+/// match — exposed for iteration (released-list helpers, hook-name routing).
+pub static ALL: &[&IntegrationSpec] = &[&CLAUDE, &GEMINI, &CODEX, &OPENCODE, &ANTIGRAVITY, &ADHOC];
+
+impl Tool {
+    /// Return this tool's integration spec.
+    pub fn spec(self) -> &'static IntegrationSpec {
+        match self {
+            Tool::Claude => &CLAUDE,
+            Tool::Gemini => &GEMINI,
+            Tool::Codex => &CODEX,
+            Tool::OpenCode => &OPENCODE,
+            Tool::Antigravity => &ANTIGRAVITY,
+            Tool::Adhoc => &ADHOC,
+        }
+    }
+}
+
+/// Tool names in the public `RELEASED_TOOLS` set, computed from specs.
+pub fn released_tool_names() -> Vec<&'static str> {
+    ALL.iter().filter(|s| s.released).map(|s| s.name).collect()
+}
+
+/// Tool names supporting background/headless launch via the tool's own
+/// detached print mode (currently only Claude `-p`). PTY-wrapped headless
+/// (`HeadlessPty`) is universal across released tools and not reported here —
+/// this set drives the larger `max_launch_count` budget given to true detached
+/// bulk launches.
+pub fn released_background_tool_names() -> Vec<&'static str> {
+    ALL.iter()
+        .filter(|s| s.released && matches!(s.launch.background, BackgroundMode::NativePrint))
+        .map(|s| s.name)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn every_tool_variant_has_a_spec() {
+        for tool in [
+            Tool::Claude,
+            Tool::Gemini,
+            Tool::Codex,
+            Tool::OpenCode,
+            Tool::Antigravity,
+            Tool::Adhoc,
+        ] {
+            let spec = tool.spec();
+            assert_eq!(spec.tool, tool, "spec.tool mismatch for {tool:?}");
+        }
+    }
+
+    #[test]
+    fn spec_name_round_trips_through_from_str() {
+        for spec in ALL {
+            let parsed: Tool = spec.name.parse().expect("parses");
+            assert_eq!(parsed, spec.tool);
+        }
+    }
+
+    #[test]
+    fn hook_names_disjoint_among_primary_specs() {
+        let mut seen: HashSet<&'static str> = HashSet::new();
+        for spec in ALL {
+            if spec.hooks.shared_hooks_with.is_some() {
+                continue;
+            }
+            for name in spec.hooks.names {
+                assert!(
+                    seen.insert(*name),
+                    "{} is owned by more than one routing spec",
+                    name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn antigravity_hooks_match_gemini() {
+        assert_eq!(ANTIGRAVITY.hooks.names, GEMINI.hooks.names);
+        assert_eq!(ANTIGRAVITY.hooks.shared_hooks_with, Some(Tool::Gemini));
+    }
+
+    #[test]
+    fn adhoc_is_quiet() {
+        assert!(ADHOC.hooks.names.is_empty());
+        assert_eq!(ADHOC.hooks.invocation, HookInvocation::None);
+        assert!(ADHOC.resume.is_none());
+        assert!(!ADHOC.released);
+    }
+
+    #[test]
+    fn released_tools_matches_prior_constant() {
+        let names = released_tool_names();
+        assert!(names.contains(&"claude"));
+        assert!(names.contains(&"gemini"));
+        assert!(names.contains(&"codex"));
+        assert!(names.contains(&"opencode"));
+        assert!(names.contains(&"antigravity"));
+        assert_eq!(names.len(), 5);
+    }
+
+    #[test]
+    fn released_background_matches_prior_constant() {
+        assert_eq!(released_background_tool_names(), vec!["claude"]);
+    }
+
+    #[test]
+    fn claude_uses_pty_default_false() {
+        assert!(!CLAUDE.launch.uses_pty_default);
+        for spec in ALL {
+            if spec.tool == Tool::Claude || spec.tool == Tool::Adhoc {
+                continue;
+            }
+            assert!(
+                spec.launch.uses_pty_default,
+                "{} should default to PTY",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn aliases_resolve_to_owning_spec() {
+        for spec in ALL {
+            for alias in spec.aliases {
+                let parsed: Tool = alias.parse().expect("alias should parse");
+                assert_eq!(
+                    parsed, spec.tool,
+                    "alias {} resolved to {:?}, expected {:?}",
+                    alias, parsed, spec.tool
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aliases_are_globally_unique() {
+        let mut seen: HashSet<&'static str> = HashSet::new();
+        for spec in ALL {
+            assert!(
+                seen.insert(spec.name),
+                "name {} is duplicated across specs",
+                spec.name
+            );
+            for alias in spec.aliases {
+                assert!(
+                    seen.insert(*alias),
+                    "alias {} collides with another tool name or alias",
+                    alias
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn released_specs_have_resume_and_cli_binary() {
+        for spec in ALL {
+            if !spec.released {
+                continue;
+            }
+            assert!(
+                !spec.cli_binary.is_empty(),
+                "released tool {} must have a cli_binary",
+                spec.name
+            );
+            assert!(
+                spec.resume.is_some(),
+                "released tool {} must define a resume spec (use None only for Adhoc)",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn max_launch_count_only_zero_for_unreleased() {
+        for spec in ALL {
+            if spec.released {
+                assert!(
+                    spec.launch.max_launch_count > 0,
+                    "released tool {} must have max_launch_count > 0",
+                    spec.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn max_launch_count_matches_background_capability() {
+        // Only claude supports headless launch today; if that ever changes,
+        // released_background_tool_names() and max_launch_count budgets should
+        // grow together — flag the assumption here.
+        assert_eq!(released_background_tool_names(), vec!["claude"]);
+        assert_eq!(CLAUDE.launch.max_launch_count, 100);
+        for spec in ALL {
+            if spec.tool != Tool::Claude && spec.released {
+                assert_eq!(
+                    spec.launch.max_launch_count, 10,
+                    "{} should match the non-background cap of 10",
+                    spec.name
+                );
+            }
+        }
+    }
+
+    // ── Released-tool drift gate ────────────────────────────────────────
+    //
+    // Every released tool must clear each gate below or document an explicit
+    // opt-out in its spec (e.g. Antigravity's `args_env: None` opts out of
+    // HCOM_*_ARGS config; Gemini/Antigravity's `resume.fork = None` opts out
+    // of `hcom f`). Adding a new released tool means filling these surfaces
+    // or pinning the opt-out here next to the existing carve-outs.
+
+    #[test]
+    fn drift_released_tools_resolve_via_launch_tool() {
+        // Adding a released tool must wire it into LaunchTool::from_str so
+        // `hcom <tool>` reaches the launcher. Each canonical name AND each
+        // alias must parse and resolve back to the owning Tool variant.
+        use crate::launcher::LaunchTool;
+        for spec in ALL {
+            if !spec.released {
+                continue;
+            }
+            let lt = LaunchTool::from_str(spec.name, false)
+                .unwrap_or_else(|e| panic!("LaunchTool::from_str({}) failed: {e}", spec.name));
+            assert_eq!(
+                lt.tool(),
+                spec.tool,
+                "{}: LaunchTool::tool() did not resolve to owning Tool",
+                spec.name
+            );
+            assert_eq!(
+                lt.cli_binary(),
+                spec.cli_binary,
+                "{}: LaunchTool::cli_binary() must match spec",
+                spec.name
+            );
+            for alias in spec.aliases {
+                let lt = LaunchTool::from_str(alias, false)
+                    .unwrap_or_else(|e| panic!("LaunchTool::from_str alias {alias} failed: {e}"));
+                assert_eq!(
+                    lt.tool(),
+                    spec.tool,
+                    "alias {alias} did not resolve to owning Tool"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn drift_released_tools_have_help_referencing_label() {
+        // Every released tool — canonical name and each alias — must produce
+        // launch help that starts with "Usage:" and references the spec's
+        // human-readable label. Generated by commands::help::generate_tool_help
+        // from the spec itself, so failure here means a spec field that
+        // affects help rendering was renamed without updating the template.
+        use crate::commands::help::get_command_help;
+        for spec in ALL {
+            if !spec.released {
+                continue;
+            }
+            let help = get_command_help(spec.name);
+            assert!(
+                help.starts_with("Usage:"),
+                "help for {} must start with 'Usage:'",
+                spec.name
+            );
+            let label_marker = format!("Launch N {} agents", spec.label);
+            assert!(
+                help.contains(&label_marker),
+                "help for {} must reference label '{}' (looked for '{}'):\n{}",
+                spec.name,
+                spec.label,
+                label_marker,
+                help
+            );
+            for alias in spec.aliases {
+                let alias_help = get_command_help(alias);
+                assert!(
+                    alias_help.starts_with("Usage:"),
+                    "alias help for {alias} must start with 'Usage:'"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn drift_released_tools_have_hook_dispatch() {
+        // Every released hook-bearing tool must round-trip through Tool's
+        // hook-ops adapter: settings_path resolves to a non-empty path and
+        // verify_hooks_installed() can be called without panicking.
+        // Borrowed-hooks specs (Antigravity → Gemini) are checked via their
+        // owning Tool — Antigravity has its own hook module but borrows the
+        // hook command names.
+        for spec in ALL {
+            if !spec.released || spec.hooks.names.is_empty() {
+                continue;
+            }
+            let path = spec.tool.hooks_settings_path();
+            assert!(
+                !path.is_empty(),
+                "{}: Tool::hooks_settings_path() must not be empty for a hook-bearing released tool",
+                spec.name
+            );
+            // verify is a read-only check; just confirm it doesn't panic.
+            let _ = spec.tool.verify_hooks_installed(false);
+        }
+    }
+
+    #[test]
+    fn drift_released_tools_args_env_documented_in_config() {
+        // args_env opt-out is allowed (Antigravity is None today); when set,
+        // the env-var name must point at a real HcomConfig field. The mapping
+        // table lives in config.rs and is asserted in
+        // `args_env_keys_match_integration_specs` — this gate just pins the
+        // expectation that each released spec either sets args_env to a
+        // non-empty string or explicitly opts out via None.
+        for spec in ALL {
+            if !spec.released {
+                continue;
+            }
+            if let Some(env_var) = spec.launch.args_env {
+                assert!(
+                    env_var.starts_with("HCOM_") && env_var.ends_with("_ARGS"),
+                    "{}: args_env '{}' must follow HCOM_*_ARGS naming",
+                    spec.name,
+                    env_var
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn drift_released_tools_have_background_mode() {
+        // Every released tool must declare a background mode other than
+        // Unsupported. Unsupported is reserved for Adhoc, which is never
+        // launched through `hcom [N] <tool>`.
+        for spec in ALL {
+            if spec.released {
+                assert_ne!(
+                    spec.launch.background,
+                    BackgroundMode::Unsupported,
+                    "{}: released tool must declare a BackgroundMode other than Unsupported",
+                    spec.name
+                );
+            } else {
+                assert_eq!(
+                    spec.launch.background,
+                    BackgroundMode::Unsupported,
+                    "{}: unreleased tool must declare BackgroundMode::Unsupported",
+                    spec.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn drift_native_print_implies_large_launch_budget() {
+        // The 100-agent budget exists because NativePrint background is
+        // truly detached (no terminal cost). HeadlessPty caps at 10 because
+        // each instance still consumes a runner. If a new tool gains
+        // NativePrint, bump max_launch_count to match Claude or update this
+        // gate.
+        for spec in ALL {
+            if !spec.released {
+                continue;
+            }
+            match spec.launch.background {
+                BackgroundMode::NativePrint => {
+                    assert_eq!(
+                        spec.launch.max_launch_count, 100,
+                        "{}: NativePrint background expects a 100-agent budget",
+                        spec.name
+                    );
+                }
+                BackgroundMode::HeadlessPty => {
+                    assert_eq!(
+                        spec.launch.max_launch_count, 10,
+                        "{}: HeadlessPty background expects a 10-agent budget",
+                        spec.name
+                    );
+                }
+                BackgroundMode::Unsupported => {
+                    unreachable!(
+                        "released tools handled by drift_released_tools_have_background_mode"
+                    )
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn command_names_covers_released_tools() {
+        use crate::commands::help::COMMAND_NAMES;
+        for spec in ALL {
+            if !spec.released {
+                continue;
+            }
+            assert!(
+                COMMAND_NAMES.contains(&spec.name),
+                "COMMAND_NAMES missing released tool {}",
+                spec.name
+            );
+            for alias in spec.aliases {
+                assert!(
+                    COMMAND_NAMES.contains(alias),
+                    "COMMAND_NAMES missing alias {} for released tool {}",
+                    alias,
+                    spec.name
+                );
+            }
+        }
+    }
+}

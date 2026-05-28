@@ -487,112 +487,49 @@ pub struct ToolConfig {
 }
 
 impl ToolConfig {
-    /// Get config for Claude.
+    /// Build a `ToolConfig` from the per-tool [`IntegrationSpec.gates`].
     ///
-    /// - `require_ready_prompt=false`: Status bar ("? for shortcuts") hides in accept-edits mode.
-    /// - `require_prompt_empty=true`: Uses vt100 dim attribute detection to distinguish
-    ///   placeholder text from user input. Placeholder (dim) = safe, user text (not dim) = block.
-    pub fn claude() -> Self {
-        Self {
-            tool: "claude".to_string(),
-            require_idle: true,
-            require_ready_prompt: false,
-            require_prompt_empty: true,
-            block_on_user_activity: true,
-            block_on_approval: true,
-            launch_requires_ready: false,
-        }
-    }
-
-    /// Get config for Gemini.
-    ///
-    /// - `require_ready_prompt=true`: "Type your message" placeholder disappears instantly when
-    ///   user types. Pattern visibility indicates 100% empty prompt. (but could be processing or idle)
-    ///
-    /// Note: Previously used DebouncedIdleChecker (0.4s debounce) because AfterAgent fired
-    /// multiple times per turn during tool loops. However, Gemini CLI commit 15c9f88da
-    /// (Dec 2025) fixed the underlying skipNextSpeakerCheck bug - AfterAgent now fires
-    /// consistently after processTurn completes, making debouncing unnecessary.
-    pub fn gemini() -> Self {
-        Self {
-            tool: "gemini".to_string(),
-            require_idle: true,
-            require_ready_prompt: true,
-            require_prompt_empty: false,
-            block_on_user_activity: true,
-            block_on_approval: true,
-            launch_requires_ready: true,
-        }
-    }
-
-    /// Get config for Codex.
-    ///
-    /// - `require_ready_prompt=false`: "? for shortcuts" is dropped by Codex's responsive
-    ///   footer in narrow terminals, making it unreliable as a gate signal.
-    /// - `require_prompt_empty=true`: Uses vt100 dim attribute detection on the `›` prompt
-    ///   character (always visible) to distinguish placeholder text from user input.
-    /// - `require_idle=true`: Native hooks set status synchronously (SessionStart→listening,
-    ///   UserPromptSubmit→active), so idle detection is near-instant.
-    pub fn codex() -> Self {
-        Self {
-            tool: "codex".to_string(),
-            require_idle: true,
-            require_ready_prompt: false,
-            require_prompt_empty: true,
-            block_on_user_activity: true,
-            block_on_approval: true,
-            launch_requires_ready: false,
-        }
-    }
-
-    /// Get config for OpenCode.
-    ///
-    /// OpenCode delivery is handled by the TypeScript plugin after session bootstrap.
-    /// PTY injects the first message to bootstrap the session, then the plugin takes over.
-    /// Runtime delivery gates stay disabled because bootstrap inject is separately gated
-    /// on the ready pattern (`ctrl+p commands`) in tool.rs, and subsequent delivery is
-    /// plugin-controlled. Launch readiness still requires that ready pattern below.
-    pub fn opencode() -> Self {
-        Self {
-            tool: "opencode".to_string(),
-            require_idle: false,
-            require_ready_prompt: false,
-            require_prompt_empty: false,
-            block_on_user_activity: false,
-            block_on_approval: false,
-            // Runtime delivery gates are off, but the launch-readiness check
-            // still waits for the `ctrl+p commands` ready pattern so the
-            // bootstrap inject lands on a usable TUI.
-            launch_requires_ready: true,
-        }
-    }
-
-    /// Get config for Antigravity.
-    ///
-    /// Antigravity TUI: hook-primary delivery; PTY injects preview `<hcom>…</hcom>` wake line.
-    /// The wake line still uses the prompt, so protect uncommitted user text.
-    pub fn antigravity() -> Self {
-        Self {
-            tool: "antigravity".to_string(),
-            require_idle: true,
-            require_ready_prompt: true,
-            require_prompt_empty: true,
-            block_on_user_activity: false,
-            block_on_approval: true,
-            launch_requires_ready: true,
-        }
-    }
-
-    /// Get config by tool.
+    /// Gate booleans (and their rationale) live in `integration_spec.rs`.
+    /// `Tool::Adhoc` borrows Claude's gates — preserved as a quirk of the old
+    /// `for_tool` match arm.
     pub fn for_tool(tool: crate::tool::Tool) -> Self {
-        match tool {
-            crate::tool::Tool::Claude => Self::claude(),
-            crate::tool::Tool::Gemini => Self::gemini(),
-            crate::tool::Tool::Codex => Self::codex(),
-            crate::tool::Tool::OpenCode => Self::opencode(),
-            crate::tool::Tool::Antigravity => Self::antigravity(),
-            crate::tool::Tool::Adhoc => Self::claude(),
+        let gates_tool = if matches!(tool, crate::tool::Tool::Adhoc) {
+            crate::tool::Tool::Claude
+        } else {
+            tool
+        };
+        let g = &gates_tool.spec().gates;
+        Self {
+            tool: tool.as_str().to_string(),
+            require_idle: g.require_idle,
+            require_ready_prompt: g.require_ready_prompt,
+            require_prompt_empty: g.require_prompt_empty,
+            block_on_user_activity: g.block_on_user_activity,
+            block_on_approval: g.block_on_approval,
+            launch_requires_ready: g.launch_requires_ready,
         }
+    }
+
+    // Per-tool constructors retained as test helpers.
+    #[cfg(test)]
+    pub fn claude() -> Self {
+        Self::for_tool(crate::tool::Tool::Claude)
+    }
+    #[cfg(test)]
+    pub fn gemini() -> Self {
+        Self::for_tool(crate::tool::Tool::Gemini)
+    }
+    #[cfg(test)]
+    pub fn codex() -> Self {
+        Self::for_tool(crate::tool::Tool::Codex)
+    }
+    #[cfg(test)]
+    pub fn opencode() -> Self {
+        Self::for_tool(crate::tool::Tool::OpenCode)
+    }
+    #[cfg(test)]
+    pub fn antigravity() -> Self {
+        Self::for_tool(crate::tool::Tool::Antigravity)
     }
 }
 

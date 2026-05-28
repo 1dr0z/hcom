@@ -914,6 +914,53 @@ mod tests {
     }
 
     #[test]
+    fn hook_tools_match_released_specs_with_hooks() {
+        use crate::commands::hooks::HOOK_TOOLS;
+        let expected: Vec<&str> = crate::integration_spec::ALL
+            .iter()
+            .filter(|s| s.released && !s.hooks.names.is_empty())
+            .map(|s| s.name)
+            .collect();
+        for name in &expected {
+            assert!(
+                HOOK_TOOLS.contains(name),
+                "HOOK_TOOLS missing released hook-bearing tool {name}"
+            );
+        }
+        for name in HOOK_TOOLS {
+            assert!(
+                expected.contains(name),
+                "HOOK_TOOLS contains {name} but it is not a released hook-bearing spec"
+            );
+        }
+    }
+
+    #[test]
+    fn launch_tools_covers_every_released_spec() {
+        // LAUNCH_TOOLS is the router-side allowlist; every released tool's
+        // canonical name and its aliases must appear here or `hcom <tool>` is
+        // not even recognised as a launch invocation.
+        for spec in crate::integration_spec::ALL {
+            if !spec.released {
+                continue;
+            }
+            assert!(
+                LAUNCH_TOOLS.contains(&spec.name),
+                "LAUNCH_TOOLS missing released tool {}",
+                spec.name
+            );
+            for alias in spec.aliases {
+                assert!(
+                    LAUNCH_TOOLS.contains(alias),
+                    "LAUNCH_TOOLS missing alias {} for {}",
+                    alias,
+                    spec.name
+                );
+            }
+        }
+    }
+
+    #[test]
     fn read_dev_root_from_kv_returns_stored_value() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("hcom.db");

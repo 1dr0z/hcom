@@ -1,4 +1,4 @@
-//! PTY delivery integration test.
+//! PTY delivery live integration test.
 //!
 //! Launches a real AI tool instance in a terminal, tests message delivery and gate blocking.
 //! Records full screen state at each phase for regression detection.
@@ -7,7 +7,7 @@
 //! - tmux installed and available by default, or another terminal preset via HCOM_TEST_TERMINAL
 //! - Target tool CLI installed (claude/gemini/codex/opencode)
 //!
-//! Phases (claude/gemini/codex):
+//! Phases (claude/gemini/codex/antigravity):
 //! 1. Launch tool via `hcom 1 <tool>` with HCOM_TERMINAL=<terminal>
 //! 2. Wait for ready event, capture and validate full screen state
 //! 3. Send message → verify delivery via events, capture post-delivery screen
@@ -25,6 +25,12 @@
 //!     cargo test -p hcom --test test_pty_delivery -- --ignored --nocapture --test-threads=1
 //!     cargo test -p hcom --test test_pty_delivery test_pty_claude -- --ignored --nocapture --test-threads=1
 //!     HCOM_TEST_TERMINAL=kitty cargo test -p hcom --test test_pty_delivery test_pty_claude -- --ignored --nocapture --test-threads=1
+//!
+//! Why `#[ignore]`:
+//! These tests are not part of `cargo test` deliberately. They launch real agent
+//! CLIs in a real terminal, need each upstream tool installed on PATH,
+//! take minutes per case, run actual agents (cost). They are
+//! meant for manual runs ie version-bump. They are not literally 'ignored', just run when needed.
 
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
@@ -59,7 +65,10 @@ macro_rules! logln {
 
 // ── Constants ──────────────────────────────────────────────────────────
 
-/// Ready patterns — must match src/tool.rs ready_pattern()
+/// Ready patterns — must match `IntegrationSpec.ready_pattern`. This test is
+/// an integration test against the hcom binary so it can't import the crate;
+/// the patterns are short and rarely change, drift is caught by the test
+/// itself when the expected pattern fails to appear on screen.
 fn ready_pattern(tool: &str) -> &'static str {
     match tool {
         "claude" => "? for shortcuts",

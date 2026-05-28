@@ -86,15 +86,25 @@ pub enum Tool {
 }
 
 impl Tool {
-    pub fn name(&self) -> &'static str {
+    /// Convert to the canonical `crate::tool::Tool` for spec lookup.
+    pub fn canonical(self) -> crate::tool::Tool {
         match self {
-            Self::Claude => "claude",
-            Self::Gemini => "gemini",
-            Self::Codex => "codex",
-            Self::OpenCode => "opencode",
-            Self::Antigravity => "antigravity",
-            Self::Adhoc => "adhoc",
+            Self::Claude => crate::tool::Tool::Claude,
+            Self::Gemini => crate::tool::Tool::Gemini,
+            Self::Codex => crate::tool::Tool::Codex,
+            Self::OpenCode => crate::tool::Tool::OpenCode,
+            Self::Antigravity => crate::tool::Tool::Antigravity,
+            Self::Adhoc => crate::tool::Tool::Adhoc,
         }
+    }
+
+    /// Integration spec for this TUI tool.
+    pub fn spec(self) -> &'static crate::integration_spec::IntegrationSpec {
+        self.canonical().spec()
+    }
+
+    pub fn name(&self) -> &'static str {
+        self.spec().name
     }
 
     /// Cycle forward (for launch panel). Adhoc is not launchable.

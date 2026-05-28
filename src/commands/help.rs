@@ -655,123 +655,24 @@ const TERM_HELP: &[HelpEntry] = &[
 
 // ── Tool launch help (claude/gemini/codex/opencode) ─────────────────────
 
-/// Per-tool differences for launch help generation.
-struct ToolHelpSpec {
-    name: &'static str,
-    label: &'static str,
-    args_env: Option<&'static str>,
-    /// Tool-specific examples (forwarded flags, etc.)
-    unique_examples: &'static [HelpEntry],
-    /// Extra env vars beyond the shared set.
-    extra_env: &'static [HelpEntry],
-    has_resume: bool,
-    has_fork: bool,
-}
-
-const CLAUDE_SPEC: ToolHelpSpec = ToolHelpSpec {
-    name: "claude",
-    label: "Claude",
-    args_env: Some("HCOM_CLAUDE_ARGS"),
-    unique_examples: &[
-        ("hcom 1 claude --agent <name>", ".claude/agents/<name>.md"),
-        (
-            "hcom claude --model sonnet|opus|haiku",
-            "Use a specific model",
-        ),
-    ],
-    extra_env: &[(
-        "HCOM_SUBAGENT_TIMEOUT",
-        "Seconds subagents keep-alive after task",
-    )],
-    has_resume: true,
-    has_fork: true,
-};
-
-const GEMINI_SPEC: ToolHelpSpec = ToolHelpSpec {
-    name: "gemini",
-    label: "Gemini",
-    args_env: Some("HCOM_GEMINI_ARGS"),
-    unique_examples: &[
-        ("hcom N gemini --yolo", "Flags forwarded to gemini"),
-        (
-            "hcom gemini --model gemini-3.1-pro-preview|gemini-2.5-flash",
-            "Use a specific model",
-        ),
-    ],
-    extra_env: &[("HCOM_GEMINI_SYSTEM_PROMPT", "System prompt (env var)")],
-    has_resume: true,
-    has_fork: false,
-};
-
-const CODEX_SPEC: ToolHelpSpec = ToolHelpSpec {
-    name: "codex",
-    label: "Codex",
-    args_env: Some("HCOM_CODEX_ARGS"),
-    unique_examples: &[
-        (
-            "hcom codex --sandbox danger-full-access",
-            "Flags forwarded to codex",
-        ),
-        (
-            "hcom codex --model gpt-5.4|gpt-5.4-mini",
-            "Use a specific model",
-        ),
-    ],
-    extra_env: &[
-        (
-            "HCOM_CODEX_SYSTEM_PROMPT",
-            "System prompt (env var or config)",
-        ),
-        (
-            "HCOM_CODEX_SANDBOX_MODE",
-            "workspace | untrusted | danger-full-access | none",
-        ),
-    ],
-    has_resume: true,
-    has_fork: true,
-};
-
-const OPENCODE_SPEC: ToolHelpSpec = ToolHelpSpec {
-    name: "opencode",
-    label: "OpenCode",
-    args_env: Some("HCOM_OPENCODE_ARGS"),
-    unique_examples: &[(
-        "hcom opencode --model anthropic/claude-sonnet-4-6|openai/gpt-5.4",
-        "Use a specific model",
-    )],
-    extra_env: &[],
-    has_resume: true,
-    has_fork: true,
-};
-
-const AGY_SPEC: ToolHelpSpec = ToolHelpSpec {
-    name: "agy",
-    label: "Antigravity",
-    args_env: None,
-    unique_examples: &[
-        ("hcom antigravity", "Long-form alias"),
-        ("hcom agy --sandbox", "Flags forwarded to agy"),
-        ("hcom r <name>", "Resume a stopped agy session"),
-    ],
-    extra_env: &[],
-    has_resume: true,
-    has_fork: false,
-};
-
-fn get_tool_spec(name: &str) -> Option<&'static ToolHelpSpec> {
-    match name {
-        "claude" => Some(&CLAUDE_SPEC),
-        "gemini" => Some(&GEMINI_SPEC),
-        "codex" => Some(&CODEX_SPEC),
-        "opencode" => Some(&OPENCODE_SPEC),
-        "agy" | "antigravity" => Some(&AGY_SPEC),
-        _ => None,
+/// Resolve the launch-help spec for a CLI name (`claude`, `agy`, …).
+fn get_tool_spec(name: &str) -> Option<&'static crate::integration_spec::IntegrationSpec> {
+    let tool: crate::tool::Tool = name.parse().ok()?;
+    let spec = tool.spec();
+    if !spec.released {
+        return None;
     }
+    Some(spec)
 }
 
-/// Generate tool launch help from spec. Returns formatted lines (not HelpEntry).
-fn generate_tool_help(spec: &ToolHelpSpec) -> String {
-    let t = spec.name;
+/// Generate tool launch help from the integration spec.
+fn generate_tool_help(spec: &crate::integration_spec::IntegrationSpec) -> String {
+    // The CLI uses "agy" rather than the canonical "antigravity" for Antigravity.
+    let t = if spec.tool == crate::tool::Tool::Antigravity {
+        "agy"
+    } else {
+        spec.name
+    };
     let inside_ai = crate::shared::is_inside_ai_tool();
     let term_desc = if inside_ai {
         "Opens new terminal"
@@ -791,7 +692,7 @@ fn generate_tool_help(spec: &ToolHelpSpec) -> String {
     let ex = |usage: &str, desc: &str| -> String { format!("    {:<34} {}", usage, desc) };
     lines.push(ex(&format!("hcom {}", t), term_desc));
     lines.push(ex(&format!("hcom 3 {}", t), "Opens 3 new terminal windows"));
-    for (u, d) in spec.unique_examples {
+    for (u, d) in spec.help.unique_examples {
         lines.push(ex(u, d));
     }
 
@@ -810,7 +711,7 @@ fn generate_tool_help(spec: &ToolHelpSpec) -> String {
     // Environment
     lines.push(String::new());
     lines.push("Environment:".to_string());
-    if let Some(args_env) = spec.args_env {
+    if let Some(args_env) = spec.launch.args_env {
         lines.push(format!(
             "    {:<28} Default args (merged with CLI)",
             args_env
@@ -829,13 +730,19 @@ fn generate_tool_help(spec: &ToolHelpSpec) -> String {
         "HCOM_HINTS"
     ));
     lines.push(format!("    {:<28} One-time bootstrap notes", "HCOM_NOTES"));
-    for (u, d) in spec.extra_env {
+    for (u, d) in spec.help.extra_env {
         lines.push(format!("    {:<28} {}", u.trim(), d));
     }
 
     // Resume / Fork
     lines.push(String::new());
-    if spec.has_fork {
+    let has_resume = spec.resume.is_some();
+    let has_fork = spec
+        .resume
+        .as_ref()
+        .map(|r| r.fork.is_some())
+        .unwrap_or(false);
+    if has_fork {
         lines.push("Resume / Fork:".to_string());
         lines.push(
             "    hcom r <target>                Resume by name / session UUID / thread name"
@@ -847,7 +754,7 @@ fn generate_tool_help(spec: &ToolHelpSpec) -> String {
         lines.push(
             "    (append :<device> to run on a remote device; see `hcom r --help`)".to_string(),
         );
-    } else if spec.has_resume {
+    } else if has_resume {
         lines.push("Resume:".to_string());
         lines.push(
             "    hcom r <target>                Resume by name / session UUID / thread name"
@@ -913,7 +820,9 @@ fn format_entries(entries: &[HelpEntry]) -> Vec<String> {
 
 // ── Lookup and render ───────────────────────────────────────────────────
 
-/// Ordered list of all commands (for docs generation).
+/// Ordered list of all commands (for docs generation). Launch tools at the
+/// tail must include every released spec name plus public aliases (e.g. `agy`).
+/// The `command_names_covers_released_tools` test guards against drift.
 pub const COMMAND_NAMES: &[&str] = &[
     "send",
     "list",
@@ -937,6 +846,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "gemini",
     "codex",
     "opencode",
+    "antigravity",
+    "agy",
 ];
 
 /// Get the top-level help text as a String.

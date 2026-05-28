@@ -1870,6 +1870,23 @@ auto_approve = false
     }
 
     #[test]
+    fn args_env_keys_match_integration_specs() {
+        let expected: std::collections::HashSet<&str> = crate::integration_spec::ALL
+            .iter()
+            .filter_map(|spec| spec.launch.args_env)
+            .collect();
+        let actual: std::collections::HashSet<&str> = FIELD_TO_ENV
+            .iter()
+            .filter_map(|(field, env_key)| field.ends_with("_args").then_some(*env_key))
+            .collect();
+
+        assert_eq!(
+            actual, expected,
+            "HcomConfig *_args env vars must match IntegrationSpec.launch.args_env"
+        );
+    }
+
+    #[test]
     fn test_hcom_config_from_env_dict_with_full_auto() {
         let mut data = HcomConfig::default().to_env_dict();
         data.insert(
