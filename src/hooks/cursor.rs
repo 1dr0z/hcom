@@ -378,10 +378,7 @@ fn cursor_hooks_cleanup_paths() -> Vec<PathBuf> {
 fn cursor_permissions_cleanup_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(home) = dirs::home_dir() {
-        push_unique(
-            &mut paths,
-            home.join(".cursor").join("cli-config.json"),
-        );
+        push_unique(&mut paths, home.join(".cursor").join("cli-config.json"));
     }
     let root = crate::runtime_env::tool_config_root();
     if dirs::home_dir().as_deref() != Some(root.as_path()) {
