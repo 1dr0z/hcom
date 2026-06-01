@@ -92,6 +92,11 @@ pub const CONFIG_KEYS: &[(&str, &str, &str)] = &[
         "string",
     ),
     (
+        "HCOM_CURSOR_ARGS",
+        "Default args for cursor-agent on launch",
+        "string",
+    ),
+    (
         "HCOM_CODEX_SANDBOX_MODE",
         "Codex permission profile (workspace | untrusted | danger-full-access | none)",
         "string",
@@ -179,6 +184,7 @@ fn toml_path_for_key(field_name: &str) -> Option<&'static str> {
         "codex_sandbox_mode" => Some("launch.codex.sandbox_mode"),
         "codex_system_prompt" => Some("launch.codex.system_prompt"),
         "opencode_args" => Some("launch.opencode.args"),
+        "cursor_args" => Some("launch.cursor.args"),
         "relay" => Some("relay.url"),
         "relay_id" => Some("relay.id"),
         "relay_token" => Some("relay.token"),
@@ -1045,7 +1051,11 @@ pub fn cmd_config(db: &HcomDb, args: &ConfigArgs, ctx: Option<&CommandContext>) 
 
                 // Side effect: auto_approve changes must update tool permissions
                 if key == "HCOM_AUTO_APPROVE" {
-                    update_auto_approve_permissions(&value);
+                    return if update_auto_approve_permissions(&value) {
+                        0
+                    } else {
+                        1
+                    };
                 }
 
                 return 0;
@@ -1400,7 +1410,7 @@ Only needed if your broker requires authentication.",
 HCOM_AUTO_APPROVE - Auto-approve safe hcom commands
 
 Purpose:
-  When enabled, Claude/Gemini/Codex/OpenCode/Antigravity auto-approve \"safe\" hcom commands
+  When enabled, Claude/Gemini/Codex/OpenCode/Antigravity/Cursor auto-approve \"safe\" hcom commands
   without requiring user confirmation.
 
 Usage:
@@ -1468,7 +1478,7 @@ Example:
   # hcom send \"@$HCOM_NAME completed task\"
 
 Notes:
-  - Only affects hcom-launched instances (hcom N claude/gemini/codex/opencode/agy)
+  - Only affects hcom-launched instances (hcom N claude/gemini/codex/opencode/agy/cursor)
   - Variable name must be a valid shell identifier
   - Works alongside HCOM_PROCESS_ID (always set) for identity",
         ),
@@ -1481,6 +1491,16 @@ Example: hcom config opencode_args \"--model o3\"
 Clear:   hcom config opencode_args \"\"
 
 Merged with launch-time cli args (launch args win on conflict).",
+        ),
+
+        "HCOM_CURSOR_ARGS" => Some(
+            "\
+HCOM_CURSOR_ARGS - Default args passed to cursor-agent on launch
+
+Example: hcom config cursor_args \"--model auto\"
+Clear:   hcom config cursor_args \"\"
+
+Prepended to launch-time cli args.",
         ),
 
         "HCOM_RELAY_ENABLED" => Some(
@@ -2024,28 +2044,22 @@ fn kitty_setup() -> i32 {
 }
 
 /// Update tool permissions when auto_approve changes.
-/// Delegates to `hcom hooks setup` for Claude/Gemini/Codex/OpenCode/Antigravity.
-fn update_auto_approve_permissions(value: &str) {
-    let enabled = !matches!(value, "0" | "false" | "False" | "no" | "off" | "");
-    // Re-run hooks setup to update tool permission files
-    let prefix = crate::runtime_env::get_hcom_prefix();
-    if let Some((cmd, prefix_args)) = prefix.split_first() {
-        let _ = std::process::Command::new(cmd)
-            .args(prefix_args)
-            .args(["hooks", "setup"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .and_then(|mut c| c.wait());
-    }
+fn update_auto_approve_permissions(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    let enabled = !matches!(normalized.as_str(), "0" | "false" | "no" | "off" | "");
+    let failures = super::hooks::refresh_installed_hook_permissions(enabled);
 
     if enabled {
         println!(
-            "Auto-approve enabled for safe hcom commands in Claude/Gemini/Codex/OpenCode/Antigravity"
+            "Auto-approve enabled for safe hcom commands in Claude/Gemini/Codex/OpenCode/Antigravity/Cursor"
         );
     } else {
         println!("Auto-approve disabled - safe hcom commands will require approval");
     }
+    for (tool, error) in &failures {
+        eprintln!("Failed to update {tool} auto-approve permissions: {error}");
+    }
+    failures.is_empty()
 }
 
 /// Trigger relay push (best-effort, silent failure). C4 fix.

@@ -531,6 +531,10 @@ impl ToolConfig {
     pub fn antigravity() -> Self {
         Self::for_tool(crate::tool::Tool::Antigravity)
     }
+    #[cfg(test)]
+    pub fn cursor() -> Self {
+        Self::for_tool(crate::tool::Tool::Cursor)
+    }
 }
 
 /// Gate evaluation result
@@ -622,6 +626,15 @@ pub struct ScreenState {
     /// race window where the gate sees
     /// `listening` + `prompt_empty`). See `SUBMIT_SETTLE_COOLDOWN_MS`.
     pub last_prompt_submit: Option<Instant>,
+    /// Latched cursor screen-scraped approval signal. Screen scraping reads a
+    /// partial frame mid-redraw as "no approval", which would flicker `approval`
+    /// false while the prompt is still up and let the gate fall through to
+    /// `prompt_has_text` (wrong "uncommitted text" status). Latch true on any
+    /// positive scrape and only clear once output has settled, so a transient
+    /// partial render can't drop the signal. Codex's OSC9 approval is event-based
+    /// (already stable) and antigravity keeps its immediate scrape; both bypass
+    /// this latch. See `APPROVAL_SCRAPE_CLEAR_MS`.
+    pub approval_scrape_latched: bool,
 }
 
 impl Default for ScreenState {
@@ -636,6 +649,7 @@ impl Default for ScreenState {
             last_output: Instant::now(),
             cols: 80,
             last_prompt_submit: None,
+            approval_scrape_latched: false,
         }
     }
 }
@@ -645,6 +659,28 @@ impl Default for ScreenState {
 /// hook's `status=active` update. Tuned from PTY test traces where the gap was
 /// about 1s; round up for headroom.
 pub(crate) const SUBMIT_SETTLE_COOLDOWN_MS: u64 = 1500;
+
+/// How long screen output must be quiet before a negative approval scrape is
+/// trusted to clear the latched signal. Redraw bursts (cursor's approval prompt
+/// animating its selection / spinner) emit partial frames that scrape as "no
+/// approval"; requiring a settled screen before clearing keeps the latch up
+/// through the burst so the gate reports `approval`, not `prompt_has_text`.
+pub(crate) const APPROVAL_SCRAPE_CLEAR_MS: u64 = 400;
+
+/// Latch decision for screen-scraped approval (cursor). A partial-render frame
+/// mid-redraw scrapes as "no approval"; holding the previous latch through such
+/// transient false reads keeps the gate reporting `approval` instead of falling
+/// through to `prompt_has_text`. The latch only clears once `output_settled`
+/// (no redraw churn) confirms the prompt has genuinely left the screen.
+pub(crate) fn latch_scraped_approval(prev: bool, scraped: bool, output_settled: bool) -> bool {
+    if scraped {
+        true
+    } else if output_settled {
+        false
+    } else {
+        prev
+    }
+}
 
 impl DeliveryState {
     /// Check if user is actively typing (within cooldown)
@@ -1194,8 +1230,18 @@ pub fn run_delivery_loop(
                     // Capture wall clock before wait to detect system sleep
                     let wall_before = crate::shared::time::now_epoch_i64() as u64;
 
-                    // Wait for notification or timeout
-                    let notified = notify.wait(IDLE_WAIT);
+                    // Recheck launch readiness promptly while the TUI is still
+                    // painting its initial screen. Some tools can start the
+                    // delivery loop just before their input prompt appears.
+                    let idle_wait = if matches!(
+                        launch_outcome,
+                        LaunchOutcome::Pending | LaunchOutcome::Blocked
+                    ) {
+                        RETRY_DELAY
+                    } else {
+                        IDLE_WAIT
+                    };
+                    let notified = notify.wait(idle_wait);
 
                     if !running.load(Ordering::Acquire) {
                         log_info(
@@ -1335,7 +1381,9 @@ pub fn run_delivery_loop(
                         let cols = state.screen.read().map(|s| s.cols).unwrap_or(80);
                         let input_box_width = (cols as usize).saturating_sub(15).max(10);
                         let text = match parsed_tool {
-                            Some(Tool::Claude) | Some(Tool::Codex) => "<hcom>".to_string(),
+                            Some(Tool::Claude) | Some(Tool::Codex) | Some(Tool::Cursor) => {
+                                "<hcom>".to_string()
+                            }
                             _ => build_wake_inject_text(db, &current_name, input_box_width),
                         };
 
@@ -1954,6 +2002,7 @@ mod tests {
             last_output: Instant::now() - Duration::from_secs(10),
             cols: 80,
             last_prompt_submit: None,
+            approval_scrape_latched: false,
         }
     }
 
@@ -2101,6 +2150,7 @@ mod tests {
         assert!(launch_ready_observed(&ToolConfig::codex(), &state));
         assert!(launch_ready_observed(&ToolConfig::claude(), &state));
         assert!(!launch_ready_observed(&ToolConfig::opencode(), &state));
+        assert!(!launch_ready_observed(&ToolConfig::cursor(), &state));
 
         let state = make_state(screen.clone(), 500);
         assert!(!launch_ready_observed(&ToolConfig::gemini(), &state));
@@ -2108,10 +2158,12 @@ mod tests {
         screen.ready = true;
         let state = make_state(screen.clone(), 500);
         assert!(launch_ready_observed(&ToolConfig::opencode(), &state));
+        assert!(launch_ready_observed(&ToolConfig::cursor(), &state));
 
         screen.prompt_empty = false;
         let state = make_state(screen, 500);
         assert!(!launch_ready_observed(&ToolConfig::codex(), &state));
+        assert!(!launch_ready_observed(&ToolConfig::cursor(), &state));
     }
 
     #[test]
@@ -2136,6 +2188,24 @@ mod tests {
         // not idle + approval + not ready → not_idle wins
         let result = evaluate_gate(&config, &state, false);
         assert_eq!(result.reason, "not_idle");
+    }
+
+    // ---- Screen-scraped approval latch ----
+
+    #[test]
+    fn latch_holds_through_transient_false_scrape() {
+        // A positive scrape latches true regardless of prior state.
+        assert!(latch_scraped_approval(false, true, false));
+        assert!(latch_scraped_approval(false, true, true));
+        // Latched true survives a transient false scrape while output is still
+        // churning (a partial-render frame, not a real dismissal).
+        assert!(latch_scraped_approval(true, false, false));
+        // Once output settles and the scrape is still false, the prompt has
+        // genuinely left the screen -> clear.
+        assert!(!latch_scraped_approval(true, false, true));
+        // Never spuriously latches from a clean idle state.
+        assert!(!latch_scraped_approval(false, false, false));
+        assert!(!latch_scraped_approval(false, false, true));
     }
 
     // ---- Lookup functions ----

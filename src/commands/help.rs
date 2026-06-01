@@ -191,7 +191,7 @@ const LIST_HELP: &[HelpEntry] = &[
     ),
     (
         "",
-        "[claude] [gemini] [codex] [opencode] [antigravity]  vanilla (hooks only)",
+        "[claude] [gemini] [codex] [opencode] [antigravity] [cursor]  vanilla (hooks only)",
     ),
     ("", "[AD-HOC]                              manual polling"),
 ];
@@ -443,7 +443,7 @@ const RESET_HELP: &[HelpEntry] = &[
     ),
     (
         "",
-        "  HCOM_DIR=$PWD/.hcom -> $PWD/.claude, .gemini, .codex, .opencode, .antigravity",
+        "  HCOM_DIR=$PWD/.hcom -> $PWD/.claude, .gemini, .codex, .opencode, .antigravity, .cursor",
     ),
     ("", ""),
     ("", "To remove local setup:"),
@@ -477,7 +477,7 @@ const CONFIG_HELP: &[HelpEntry] = &[
         "Subagent keep-alive seconds after task",
     ),
     (
-        "  claude_args / gemini_args / codex_args / opencode_args",
+        "  claude_args / gemini_args / codex_args / opencode_args / cursor_args",
         "",
     ),
     ("  auto_approve", "Auto-approve safe hcom commands"),
@@ -609,11 +609,11 @@ const HOOKS_HELP: &[HelpEntry] = &[
     ("hooks status", "Same as above"),
     (
         "hooks add [tool]",
-        "Add hooks (claude | gemini | codex | opencode | all)",
+        "Add hooks (claude | gemini | codex | opencode | antigravity | cursor | all)",
     ),
     (
         "hooks remove [tool]",
-        "Remove hooks (claude | gemini | codex | opencode | all)",
+        "Remove hooks (claude | gemini | codex | opencode | antigravity | cursor | all)",
     ),
     ("", ""),
     (
@@ -667,11 +667,13 @@ fn get_tool_spec(name: &str) -> Option<&'static crate::integration_spec::Integra
 
 /// Generate tool launch help from the integration spec.
 fn generate_tool_help(spec: &crate::integration_spec::IntegrationSpec) -> String {
-    // The CLI uses "agy" rather than the canonical "antigravity" for Antigravity.
-    let t = if spec.tool == crate::tool::Tool::Antigravity {
-        "agy"
-    } else {
-        spec.name
+    // The displayed launch keyword can differ from the canonical internal
+    // `spec.name`: Antigravity launches as "agy", Cursor as "cursor-agent"
+    // (the real CLI binary — there is no `cursor` command to pass through to).
+    let t = match spec.tool {
+        crate::tool::Tool::Antigravity => "agy",
+        crate::tool::Tool::Cursor => "cursor-agent",
+        _ => spec.name,
     };
     let inside_ai = crate::shared::is_inside_ai_tool();
     let term_desc = if inside_ai {
@@ -848,6 +850,8 @@ pub const COMMAND_NAMES: &[&str] = &[
     "opencode",
     "antigravity",
     "agy",
+    "cursor",
+    "cursor-agent",
 ];
 
 /// Get the top-level help text as a String.
@@ -860,7 +864,7 @@ Usage:\n\
   hcom <command>                        Run command\n\
 \n\
 Launch:\n\
-  hcom [N] claude|gemini|codex|opencode|agy [flags] [tool-args]\n\
+  hcom [N] claude|gemini|codex|opencode|agy|cursor-agent [flags] [tool-args]\n\
   hcom r <name>                         Resume stopped agent\n\
   hcom f <name>                         Fork agent session (claude/codex/opencode)\n\
   hcom kill <name(s)|tag:T|all>         Kill + close terminal pane\n\

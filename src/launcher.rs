@@ -21,7 +21,7 @@ use crate::instances;
 use crate::paths;
 use crate::shared::constants::{HCOM_IDENTITY_VARS, TOOL_MARKER_VARS};
 use crate::terminal;
-use crate::tools::{codex_preprocessing, opencode_preprocessing};
+use crate::tools::{codex_preprocessing, cursor_preprocessing, opencode_preprocessing};
 
 /// Canonical tool types for launch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +32,7 @@ pub enum LaunchTool {
     Codex,
     OpenCode,
     Antigravity,
+    Cursor,
 }
 
 impl LaunchTool {
@@ -44,6 +45,7 @@ impl LaunchTool {
             "codex" => Ok(LaunchTool::Codex),
             "opencode" => Ok(LaunchTool::OpenCode),
             "antigravity" | "agy" => Ok(LaunchTool::Antigravity),
+            "cursor" | "cursor-agent" => Ok(LaunchTool::Cursor),
             _ => bail!("Unknown tool: {}", s),
         }
     }
@@ -56,6 +58,7 @@ impl LaunchTool {
             LaunchTool::Codex => "codex",
             LaunchTool::OpenCode => "opencode",
             LaunchTool::Antigravity => "antigravity",
+            LaunchTool::Cursor => "cursor",
         }
     }
 
@@ -70,6 +73,7 @@ impl LaunchTool {
             LaunchTool::Codex => crate::tool::Tool::Codex,
             LaunchTool::OpenCode => crate::tool::Tool::OpenCode,
             LaunchTool::Antigravity => crate::tool::Tool::Antigravity,
+            LaunchTool::Cursor => crate::tool::Tool::Cursor,
         }
     }
 
@@ -132,7 +136,8 @@ impl LaunchBackend {
             LaunchTool::Gemini
             | LaunchTool::Codex
             | LaunchTool::OpenCode
-            | LaunchTool::Antigravity => LaunchBackend::HeadlessPty,
+            | LaunchTool::Antigravity
+            | LaunchTool::Cursor => LaunchBackend::HeadlessPty,
         }
     }
 }
@@ -325,8 +330,7 @@ fn install_diag_context(tool: &LaunchTool, paths: &[(&str, std::path::PathBuf)])
 ///
 /// Uses verify-first pattern: read-only check first, only write if needed.
 /// Strict gate: refuses to launch if hooks can't be installed.
-fn ensure_hooks_installed(tool: &LaunchTool) -> Result<()> {
-    let include_permissions = true;
+fn ensure_hooks_installed(tool: &LaunchTool, include_permissions: bool) -> Result<()> {
     match tool {
         LaunchTool::Claude | LaunchTool::ClaudePty => {
             if crate::hooks::claude::verify_claude_hooks_installed(None, include_permissions) {
@@ -436,6 +440,23 @@ fn ensure_hooks_installed(tool: &LaunchTool) -> Result<()> {
                 bail!(
                     "Failed to setup Antigravity hooks: {e}\n\
                      Run: hcom hooks add antigravity\n\
+                     {diag}"
+                );
+            }
+            Ok(())
+        }
+        LaunchTool::Cursor => {
+            if crate::hooks::cursor::verify_cursor_hooks_installed(include_permissions) {
+                return Ok(());
+            }
+            if let Err(e) = crate::hooks::cursor::try_setup_cursor_hooks(include_permissions) {
+                let diag = install_diag_context(
+                    tool,
+                    &[("hooks_path", crate::hooks::cursor::get_cursor_hooks_path())],
+                );
+                bail!(
+                    "Failed to setup Cursor hooks: {e}\n\
+                     Run: hcom hooks add cursor\n\
                      {diag}"
                 );
             }
@@ -868,6 +889,27 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         );
     }
 
+    let tool_binary = normalized.cli_binary();
+    if !is_tool_installed(tool_binary) {
+        bail!("'{}' is not installed or not in PATH", tool_binary);
+    }
+
+    if !params.skip_validation {
+        let validation_errors = validate_tool_args(&normalized, &params.args);
+        if !validation_errors.is_empty() {
+            bail!("{}", validation_errors.join("\n"));
+        }
+    }
+
+    // Load config before hook setup so auto_approve is authoritative for
+    // wrapped launches as well as manual `hcom hooks add`.
+    let hcom_config = HcomConfig::load(None).unwrap_or_else(|e| {
+        eprintln!("[hcom] warn: config load failed, using defaults: {e}");
+        let mut c = HcomConfig::default();
+        c.normalize();
+        c
+    });
+
     // For Codex: probe CODEX_HOME writability synchronously. Sandboxed parent
     // codex would otherwise spawn a child that hangs on the readonly-state-DB
     // repair prompt. Failing here lets the parent's sandbox-escalation flow
@@ -877,15 +919,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     }
 
     // Ensure hooks are installed (strict: refuse to launch without hooks)
-    ensure_hooks_installed(&normalized)?;
-
-    // Load config
-    let hcom_config = HcomConfig::load(None).unwrap_or_else(|e| {
-        eprintln!("[hcom] warn: config load failed, using defaults: {e}");
-        let mut c = HcomConfig::default();
-        c.normalize();
-        c
-    });
+    ensure_hooks_installed(&normalized, hcom_config.auto_approve)?;
 
     // Build base environment
     let mut base_env = build_launch_env(&hcom_config);
@@ -919,14 +953,6 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
         resolve_explicit_name_conflict(db, name)?;
     }
 
-    // Tool args validation
-    if !params.skip_validation {
-        let validation_errors = validate_tool_args(&normalized, &params.args);
-        if !validation_errors.is_empty() {
-            bail!("{}", validation_errors.join("\n"));
-        }
-    }
-
     // System prompt file for Gemini/Codex
     if let Some(ref sp) = params.system_prompt
         && normalized == LaunchTool::Gemini
@@ -936,6 +962,9 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
     }
 
     let working_dir = params.cwd.as_deref().unwrap_or(".");
+    if matches!(normalized, LaunchTool::Cursor) {
+        cursor_preprocessing::ensure_cursor_workspace_trusted(Path::new(working_dir))?;
+    }
     let launcher_name: String = params.launcher.take().unwrap_or_else(|| {
         // Try to resolve caller identity from the live process binding.
         let process_id = std::env::var("HCOM_PROCESS_ID").ok();
@@ -1100,16 +1129,6 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
             Ok(())
         })() {
             errors.push(json!({"tool": normalized.as_str(), "error": e.to_string()}));
-            continue;
-        }
-
-        // Check tool binary exists before launching
-        let tool_binary = normalized.cli_binary();
-        if !is_tool_installed(tool_binary) {
-            eprintln!("Error: '{}' is not installed or not in PATH", tool_binary);
-            errors.push(
-                json!({"tool": normalized.as_str(), "error": format!("{} not found", tool_binary)}),
-            );
             continue;
         }
 
@@ -1348,6 +1367,7 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                     opencode_preprocessing::preprocess_opencode_env(
                         &mut instance_env,
                         &instance_name,
+                        hcom_config.auto_approve,
                     );
 
                     instances::update_instance_position(
@@ -1394,6 +1414,33 @@ pub fn launch(db: &HcomDb, mut params: LaunchParams) -> Result<LaunchResult> {
                         &mut BackgroundLaunchCtx {
                             db,
                             tool: "antigravity",
+                            instance_name: &instance_name,
+                            process_id: &process_id,
+                            terminal_mode,
+                            tag: params.tag.as_deref().unwrap_or(""),
+                            working_dir,
+                            log_files: &mut log_files,
+                            handles: &mut handles,
+                        },
+                        &mut instance_env,
+                        &params.args,
+                        &params,
+                        inside_ai_tool,
+                    )
+                }
+                LaunchTool::Cursor => {
+                    instances::update_instance_position(
+                        db,
+                        &instance_name,
+                        &serde_json::Map::from_iter([(
+                            "launch_args".to_string(),
+                            json!(params.args),
+                        )]),
+                    );
+                    launch_pty_or_background(
+                        &mut BackgroundLaunchCtx {
+                            db,
+                            tool: "cursor",
                             instance_name: &instance_name,
                             process_id: &process_id,
                             terminal_mode,
@@ -1507,6 +1554,7 @@ fn validate_tool_args(tool: &LaunchTool, args: &[String]) -> Vec<String> {
             errs.extend(crate::tools::codex_args::validate_conflicts(&spec));
             errs
         }
+        LaunchTool::Cursor => crate::tools::cursor_preprocessing::validate_cursor_args(args),
         LaunchTool::OpenCode | LaunchTool::Antigravity => Vec::new(),
     }
 }
@@ -1552,6 +1600,13 @@ mod tests {
             LaunchTool::Antigravity
         );
         assert!(LaunchTool::from_str("unknown", false).is_err());
+    }
+
+    #[test]
+    fn validate_cursor_print_mode_fails_fast() {
+        let errors = validate_tool_args(&LaunchTool::Cursor, &["--print".to_string()]);
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("not supported"));
     }
 
     #[test]

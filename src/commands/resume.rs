@@ -992,11 +992,142 @@ fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<
         }
         "opencode" => merge_opencode_args(original, resume),
         "antigravity" => merge_antigravity_args(original, resume),
+        "cursor" => merge_cursor_args(original, resume),
         _ => {
             // For unknown tools: resume args only.
             resume.to_vec()
         }
     }
+}
+
+/// Merge cursor-agent original launch args with resume args.
+///
+/// cursor's launch_args bake in `HCOM_CURSOR_ARGS` (e.g. `--model composer-2.5
+/// --force`) plus the trailing positional task prompt that the launcher appends
+/// (`launcher.rs` Positional shape). On resume we must:
+///   - preserve user config flags (`--model`, `--force`/`--yolo`, `--sandbox`,
+///     `--mode`/`--plan`, `--output-format`, `--api-key`, `-H`/`--header`,
+///     `--plugin-dir`, …) so the resumed agent keeps its model/permissions;
+///   - drop the stale positional prompt — re-submitting the original task on a
+///     resume would re-run it;
+///   - strip flags hcom owns at relaunch: prior session selectors
+///     (`--resume`/`--continue`) and cwd/worktree selectors
+///     (`--workspace`, `-w`/`--worktree`, `--worktree-base`,
+///     `--skip-worktree-setup`) — the launcher sets the working directory
+///     itself (snapshot dir or `--dir`), so a stale `--workspace` would fight
+///     the recovered cwd and `--worktree` would spawn a *new* worktree.
+///
+/// Resume args (`--resume <session_id>` + any user-supplied extra args) come
+/// first; preserved original flags follow. For **singular** flags that the
+/// resume args already specify (e.g. a resume-time `--model x`), the baked
+/// original copy is dropped so the resume value wins under commander.js
+/// last-wins — matching claude/codex/gemini precedence. **Repeatable** flags
+/// (`-H`/`--header`, `--plugin-dir`) are always kept and concatenate.
+fn merge_cursor_args(original: &[String], resume: &[String]) -> Vec<String> {
+    // Flags whose following token is a value (so it isn't mistaken for the
+    // positional prompt). `--resume`/`--worktree` also accept a value but are
+    // stripped, so they're handled by DROP_WITH_VALUE below. The repeatable
+    // header short flag `-H` is handled separately (case-sensitive) because
+    // lowercasing collides with the `-h` help flag.
+    const VALUE_FLAGS: &[&str] = &[
+        "--api-key",
+        "--header",
+        "--output-format",
+        "--mode",
+        "--model",
+        "--sandbox",
+        "--plugin-dir",
+    ];
+    // Strip these flags (and their value/optional-value token when split form).
+    const DROP_WITH_VALUE: &[&str] = &[
+        "--resume",
+        "--workspace",
+        "--worktree",
+        "-w",
+        "--worktree-base",
+    ];
+    const DROP_BOOLEAN: &[&str] = &["--continue", "--skip-worktree-setup"];
+    // Repeatable flags concatenate across resume + original, so they're never
+    // deduped (long names lowercased; `-H` matched case-sensitively below).
+    const REPEATABLE: &[&str] = &["--header", "--plugin-dir"];
+
+    let is_flag = |t: &str| t.starts_with('-');
+    let header_flags = ["-H"]; // cursor's repeatable header short flag takes a value
+    let is_repeatable = |token: &str, bare: &str| REPEATABLE.contains(&bare) || token == "-H";
+
+    // Singular flag base-names already present in the resume args — the baked
+    // original copy of any of these is dropped so resume wins (consistency with
+    // the other tools' resume-precedence). Repeatables are excluded.
+    let mut resume_singular_flags = std::collections::HashSet::new();
+    for token in resume {
+        if !is_flag(token) {
+            continue;
+        }
+        let lower = token.to_lowercase();
+        let bare = lower.split('=').next().unwrap_or(&lower).to_string();
+        if is_repeatable(token, &bare) {
+            continue;
+        }
+        resume_singular_flags.insert(bare);
+    }
+
+    let mut preserved = Vec::new();
+    let mut i = 0;
+    while i < original.len() {
+        let token = &original[i];
+        let lower = token.to_lowercase();
+        let bare = lower.split('=').next().unwrap_or(&lower);
+
+        if DROP_BOOLEAN.contains(&bare) {
+            i += 1;
+            continue;
+        }
+        if DROP_WITH_VALUE.contains(&bare) {
+            // `--flag=value`: single token. Bare `--flag`: consume an optional
+            // following value only when it isn't itself a flag.
+            if !token.contains('=') && i + 1 < original.len() && !is_flag(&original[i + 1]) {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        // Resume already specifies this singular flag → drop the baked dup
+        // (and its value token, when split form) so resume wins.
+        let deduped = !is_repeatable(token, bare) && resume_singular_flags.contains(bare);
+        let takes_value = VALUE_FLAGS.contains(&bare) || header_flags.contains(&token.as_str());
+        if takes_value {
+            if !deduped {
+                preserved.push(token.clone());
+            }
+            if !token.contains('=') && i + 1 < original.len() {
+                if !deduped {
+                    preserved.push(original[i + 1].clone());
+                }
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if is_flag(token) {
+            // Unknown/boolean config flag (e.g. --force, --yolo, --plan,
+            // --approve-mcps, --trust): preserve unless resume overrides it.
+            if !deduped {
+                preserved.push(token.clone());
+            }
+            i += 1;
+            continue;
+        }
+        // Bare positional = the stale task prompt. Drop it.
+        i += 1;
+    }
+
+    let mut merged = resume.to_vec();
+    merged.extend(preserved);
+    // The unified launcher rejects cursor print flags with a clear error. Keep
+    // them visible here so a stale baked flag cannot silently change meaning.
+    merged
 }
 
 /// Merge agy original args with resume args.
@@ -1422,7 +1553,67 @@ fn find_session_on_disk(session_id: &str) -> Option<(String, Option<String>)> {
         return Some((tool, Some(path)));
     }
 
+    // 5. Cursor
+    if let Some(path) = derive_cursor_transcript_path(session_id) {
+        let tool = detect_agent_type(&path).to_string();
+        return Some((tool, Some(path)));
+    }
+
     None
+}
+
+/// Locate a cursor-agent transcript by conversation UUID (== hcom session_id).
+/// cursor writes it at `~/.cursor/projects/<slug>/agent-transcripts/<uuid>/
+/// <uuid>.jsonl` — the same path the hook reports. The `<slug>` can't be
+/// derived from the UUID, so scan the per-project dirs for the nested file.
+/// (The flat `projects/agent-transcripts/<uuid>.jsonl` mirror is skipped: it
+/// has no sibling `.workspace-trusted`, so no cwd could be recovered from it.)
+fn derive_cursor_transcript_path(session_id: &str) -> Option<String> {
+    let projects = dirs::home_dir()?.join(".cursor").join("projects");
+    let file = format!("{session_id}.jsonl");
+    for entry in std::fs::read_dir(&projects).ok()?.flatten() {
+        let candidate = entry
+            .path()
+            .join("agent-transcripts")
+            .join(session_id)
+            .join(&file);
+        if candidate.exists() {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+    None
+}
+
+/// cursor transcripts carry no `cwd`, so recover it from the per-workspace
+/// `.workspace-trusted` marker cursor writes at
+/// `~/.cursor/projects/<slug>/.workspace-trusted` (`workspacePath` field). The
+/// transcript lives under `<slug>/agent-transcripts/<uuid>/<uuid>.jsonl`, so
+/// walk up to the project-slug dir (the direct child of `projects/`) and read
+/// it. Returns the recorded (canonicalized) workspace path.
+fn recover_cursor_cwd(transcript_path: &str) -> Option<String> {
+    let path = std::path::Path::new(transcript_path);
+    let mut slug_dir = None;
+    let mut cursor = path.parent();
+    while let Some(dir) = cursor {
+        if dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            == Some("projects")
+        {
+            slug_dir = Some(dir);
+            break;
+        }
+        cursor = dir.parent();
+    }
+    let marker = slug_dir?.join(".workspace-trusted");
+    let data = std::fs::read_to_string(&marker).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&data).ok()?;
+    parsed
+        .get("workspacePath")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
 
 /// Recover the session's working directory from the tool's on-disk state.
@@ -1434,6 +1625,8 @@ fn find_session_on_disk(session_id: &str) -> Option<(String, Option<String>)> {
 /// - **Gemini**: the session JSON has `projectHash = sha256(cwd)` (hex).
 ///   `~/.gemini/projects.json` maps `cwd → short-id`. Hash each key and
 ///   match against `projectHash` to recover the original CWD.
+/// - **Cursor**: the transcript has no `cwd`; recover it from the sibling
+///   `~/.cursor/projects/<slug>/.workspace-trusted` marker (`workspacePath`).
 fn extract_cwd_from_transcript(path: &str, tool: &str) -> Option<String> {
     match tool {
         "claude" => scan_lines_for_cwd(path, 20, |v| v.get("cwd").and_then(|c| c.as_str())),
@@ -1443,6 +1636,7 @@ fn extract_cwd_from_transcript(path: &str, tool: &str) -> Option<String> {
                 .and_then(|c| c.as_str())
         }),
         "gemini" => recover_gemini_cwd(path),
+        "cursor" => recover_cursor_cwd(path),
         _ => None,
     }
 }
@@ -1538,7 +1732,8 @@ fn build_adopt_plan(
                 "Session {sid} not found. Searched:\n  \
                  - Claude:   {claude}/*/{sid}.jsonl\n  \
                  - Codex:    ~/.codex/sessions/**/*-{sid}.jsonl\n  \
-                 - Gemini:   ~/.gemini/tmp/*/chats/session-*-{short}*.json",
+                 - Gemini:   ~/.gemini/tmp/*/chats/session-*-{short}*.json\n  \
+                 - Cursor:   ~/.cursor/projects/*/agent-transcripts/{sid}/{sid}.jsonl",
                 sid = session_id,
                 claude = claude_projects.display(),
                 short = session_id.split('-').next().unwrap_or(session_id),
@@ -1635,6 +1830,30 @@ mod tests {
     fn test_build_resume_args_claude_fork() {
         let args = build_resume_args("claude", "sess-123", true);
         assert_eq!(args, s(&["--resume", "sess-123", "--fork-session"]));
+    }
+
+    #[test]
+    fn test_recover_cursor_cwd_from_workspace_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        // Mirror ~/.cursor/projects/<slug>/{agent-transcripts/<uuid>/<uuid>.jsonl,.workspace-trusted}
+        let slug = dir.path().join("projects").join("Users-anno-Dev-x");
+        let tdir = slug.join("agent-transcripts").join("uuid-1");
+        std::fs::create_dir_all(&tdir).unwrap();
+        std::fs::write(
+            slug.join(".workspace-trusted"),
+            json!({"workspacePath": "/Users/anno/Dev/x", "trustMethod": null}).to_string(),
+        )
+        .unwrap();
+        let transcript = tdir.join("uuid-1.jsonl");
+        std::fs::write(&transcript, "{}").unwrap();
+
+        assert_eq!(
+            recover_cursor_cwd(&transcript.to_string_lossy()),
+            Some("/Users/anno/Dev/x".to_string())
+        );
+        // No marker → None (graceful: caller falls back to $PWD).
+        std::fs::remove_file(slug.join(".workspace-trusted")).unwrap();
+        assert_eq!(recover_cursor_cwd(&transcript.to_string_lossy()), None);
     }
 
     #[test]
@@ -1774,6 +1993,135 @@ mod tests {
             &s(&["--conversation", "new-id"]),
         );
         assert_eq!(merged, s(&["--conversation", "new-id", "--sandbox"]));
+    }
+
+    /// cursor launch_args bake in HCOM_CURSOR_ARGS config plus a trailing
+    /// positional prompt. Resume must preserve config flags, drop the stale
+    /// prompt + old --resume, and prepend the new resume args.
+    #[test]
+    fn test_merge_resume_args_cursor_preserves_config_drops_prompt_and_session() {
+        let merged = merge_resume_args(
+            "cursor",
+            &s(&[
+                "--model",
+                "composer-2.5",
+                "--force",
+                "--resume",
+                "old-chat",
+                "fix the parser bug",
+            ]),
+            &s(&["--resume", "new-chat-id"]),
+        );
+        assert_eq!(
+            merged,
+            s(&[
+                "--resume",
+                "new-chat-id",
+                "--model",
+                "composer-2.5",
+                "--force"
+            ])
+        );
+    }
+
+    /// cwd/worktree selectors are owned by the launcher (snapshot dir or --dir),
+    /// so a stale --workspace / -w must be stripped and not fight the recovered
+    /// cwd. --continue and the prompt are also dropped.
+    #[test]
+    fn test_merge_resume_args_cursor_strips_workspace_worktree_continue() {
+        let merged = merge_resume_args(
+            "cursor",
+            &s(&[
+                "--workspace",
+                "/old/path",
+                "--continue",
+                "-w",
+                "feature-x",
+                "--sandbox",
+                "enabled",
+                "do the task",
+            ]),
+            &s(&["--resume", "sid"]),
+        );
+        assert_eq!(merged, s(&["--resume", "sid", "--sandbox", "enabled"]));
+    }
+
+    /// `--flag=value` form and the repeatable `-H` header value flag must be
+    /// preserved intact; the stale `--resume=old` equals-form is stripped.
+    #[test]
+    fn test_merge_resume_args_cursor_equals_form_and_header() {
+        let merged = merge_resume_args(
+            "cursor",
+            &s(&[
+                "--model=sonnet-4",
+                "--resume=old",
+                "-H",
+                "X-Trace: 1",
+                "summarize",
+            ]),
+            &s(&["--resume", "sid"]),
+        );
+        assert_eq!(
+            merged,
+            s(&["--resume", "sid", "--model=sonnet-4", "-H", "X-Trace: 1"])
+        );
+    }
+
+    /// Precedence: a resume-time `--model x` must beat the baked `--model y`.
+    /// The baked singular copy is dropped (resume wins), while repeatable
+    /// flags from both sides concatenate.
+    #[test]
+    fn test_merge_resume_args_cursor_resume_value_beats_baked() {
+        let merged = merge_resume_args(
+            "cursor",
+            &s(&["--model", "y", "-H", "X-Baked: 1", "--force", "stale task"]),
+            &s(&["--resume", "sid", "--model", "x", "-H", "X-Resume: 1"]),
+        );
+        assert_eq!(
+            merged,
+            s(&[
+                "--resume",
+                "sid",
+                "--model",
+                "x",
+                "-H",
+                "X-Resume: 1",
+                // baked --model y dropped (resume wins); -H kept (repeatable);
+                // --force preserved.
+                "-H",
+                "X-Baked: 1",
+                "--force",
+            ])
+        );
+    }
+
+    /// A baked `--print`/`-p`/`--stream-partial-output` stays visible so the
+    /// launcher can reject it clearly instead of silently changing semantics.
+    #[test]
+    fn test_merge_resume_args_cursor_preserves_print_flags_for_validation() {
+        let merged = merge_resume_args(
+            "cursor",
+            &s(&[
+                "-p",
+                "--print",
+                "--stream-partial-output",
+                "--model",
+                "composer-2.5",
+            ]),
+            &s(&["--resume", "sid"]),
+        );
+        assert_eq!(
+            merged,
+            s(&[
+                "--resume",
+                "sid",
+                "-p",
+                "--print",
+                "--stream-partial-output",
+                "--model",
+                "composer-2.5"
+            ])
+        );
     }
 
     #[test]

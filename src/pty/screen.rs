@@ -265,6 +265,28 @@ impl ScreenTracker {
         has_marker && (has_question || has_footer)
     }
 
+    /// Cursor-specific approval detection: cursor renders a shell-command
+    /// permission prompt as plain text ("Run this command?" + a "Run (once) /
+    /// Add … to allowlist / Auto-run everything / Skip (esc or n)" menu). No
+    /// OSC9 fires, so scrape the screen. Require the question marker AND a menu
+    /// footer option so a stray "Run this command?" in scrollback can't flip it.
+    /// (File edits auto-apply by default and don't prompt — verified live.)
+    pub fn is_cursor_approval_visible(&self) -> bool {
+        let screen = self.parser.screen();
+        let (_rows, cols) = screen.size();
+        let mut has_question = false;
+        let mut has_footer = false;
+        for line in screen.rows(0, cols) {
+            if line.contains("Run this command?") {
+                has_question = true;
+            }
+            if line.contains("Auto-run everything") || line.contains("Skip (esc") {
+                has_footer = true;
+            }
+        }
+        has_question && has_footer
+    }
+
     /// Check if output has been stable for N milliseconds
     /// Note: ms=0 returns true (always stable), which is valid for tools that skip stability check
     pub fn is_output_stable(&self, ms: u64) -> bool {
@@ -370,6 +392,7 @@ impl ScreenTracker {
             Ok(Tool::Codex) => self.get_codex_input_text(),
             Ok(Tool::OpenCode) => None, // OpenCode: plugin handles delivery, no PTY input detection needed
             Ok(Tool::Antigravity) => self.get_antigravity_input_text(),
+            Ok(Tool::Cursor) => self.get_cursor_input_text(),
             Ok(Tool::Adhoc) => None,
             Err(_) => None,
         }
@@ -634,6 +657,29 @@ impl ScreenTracker {
         None
     }
 
+    /// Extract Cursor Agent input text.
+    ///
+    /// Cursor renders a `→` prompt with dim placeholder text while idle.
+    /// Submitted or user-entered text uses normal intensity.
+    fn get_cursor_input_text(&self) -> Option<String> {
+        let lines = self.get_screen_lines();
+        for (row_idx, line) in lines.iter().enumerate().rev() {
+            let trimmed = line.trim_start();
+            if let Some(text) = trimmed.strip_prefix("→ ") {
+                let text = trim_with_nbsp(text);
+                if text.is_empty() {
+                    return Some(String::new());
+                }
+                return match self.is_dim_after_prompt(row_idx as u16, "→") {
+                    Some(true) => Some(String::new()),
+                    Some(false) => Some(text.to_string()),
+                    None => Some(text.to_string()),
+                };
+            }
+        }
+        None
+    }
+
     /// Check and perform periodic dump if 5 seconds elapsed
     /// Returns true if dump was performed
     pub fn check_periodic_dump(&mut self, tool: &str, inject_port: u16, label: &str) -> bool {
@@ -695,6 +741,7 @@ impl ScreenTracker {
                     Ok(Tool::Codex) => Some("›"),
                     Ok(Tool::Gemini) => Some(">"),
                     Ok(Tool::Antigravity) => Some(">"),
+                    Ok(Tool::Cursor) => Some("→"),
                     _ => None,
                 };
                 if let Some(pc) = prompt_char {
@@ -907,6 +954,35 @@ mod tests {
         assert!(t.is_antigravity_approval_visible());
     }
 
+    // ---- Cursor approval detection ----
+
+    #[test]
+    fn cursor_detects_approval_prompt() {
+        let mut t = make_tracker(24, 80, "");
+        assert!(!t.is_cursor_approval_visible());
+        // Real cursor shell-approval menu (captured live).
+        t.process(
+            b"Run this command?\r\nNot in allowlist: uptime\r\n  Run (once) (y)\r\n  Auto-run everything (shift+tab)\r\n  Skip (esc or n)\r\n",
+        );
+        assert!(t.is_cursor_approval_visible());
+    }
+
+    #[test]
+    fn cursor_question_alone_does_not_trigger() {
+        // The question text in narration/scrollback without the menu footer
+        // must not flip approval on.
+        let mut t = make_tracker(24, 80, "");
+        t.process(b"I'll ask: Run this command? then proceed.\r\n> idle\r\n");
+        assert!(!t.is_cursor_approval_visible());
+    }
+
+    #[test]
+    fn cursor_no_false_positive_without_question() {
+        let mut t = make_tracker(24, 80, "");
+        t.process(b"> hello world\r\nrunning a build\r\n");
+        assert!(!t.is_cursor_approval_visible());
+    }
+
     // ---- Codex input extraction ----
 
     #[test]
@@ -958,6 +1034,27 @@ mod tests {
             t.get_codex_input_text(),
             Some("<hcom>test message</hcom>".to_string())
         );
+    }
+
+    // ---- Cursor input extraction ----
+
+    #[test]
+    fn cursor_extracts_non_dim_text_after_prompt() {
+        let mut t = make_tracker(24, 80, "");
+        t.process("→ <hcom>\r\n".as_bytes());
+        assert_eq!(t.get_cursor_input_text(), Some("<hcom>".to_string()));
+    }
+
+    #[test]
+    fn cursor_dim_placeholder_returns_empty() {
+        let mut t = make_tracker(24, 80, "");
+        let mut data = Vec::new();
+        data.extend_from_slice("→ ".as_bytes());
+        data.extend_from_slice(b"\x1b[2mPlan, search, build anything\x1b[0m");
+        data.extend_from_slice(b"\r\n");
+        t.process(&data);
+        assert_eq!(t.get_cursor_input_text(), Some(String::new()));
+        assert!(t.is_prompt_empty("cursor"));
     }
 
     // ---- Gemini input extraction ----

@@ -6,6 +6,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod cursor;
 pub mod gemini;
 pub mod opencode;
 pub mod shared;
@@ -26,6 +27,7 @@ pub enum ToolKind {
     Gemini,
     Codex,
     OpenCode,
+    Cursor,
 }
 
 /// Options for reading a transcript.
@@ -61,6 +63,7 @@ pub fn read(path: &Path, kind: ToolKind, opts: &ReadOptions) -> Result<Vec<Excha
         ToolKind::Antigravity => claude::parse_claude_jsonl(path, opts.last, opts.detailed),
         ToolKind::Gemini => gemini::parse_gemini_json(path, opts.last),
         ToolKind::Codex => codex::parse_codex_jsonl(path, opts.last, opts.detailed),
+        ToolKind::Cursor => cursor::parse_cursor_jsonl(path, opts.last, opts.detailed),
         ToolKind::OpenCode => {
             let sid = opts.session_id.as_deref().unwrap_or("");
             if sid.is_empty() {
@@ -92,6 +95,11 @@ pub fn detect_kind_from_path(path: &str) -> Option<ToolKind> {
         Some(ToolKind::Gemini)
     } else if path.ends_with(".db") {
         Some(ToolKind::OpenCode)
+    } else if path.contains("agent-transcripts") {
+        // Cursor's `.jsonl` would otherwise fall through to Claude. Key off the
+        // cursor-unique `agent-transcripts` segment (not the `.jsonl` extension,
+        // which is shared with Claude/Codex).
+        Some(ToolKind::Cursor)
     } else {
         None
     }
@@ -106,6 +114,7 @@ pub fn kind_from_agent_or_path(agent: &str, path: &str) -> ToolKind {
         "gemini" => ToolKind::Gemini,
         "codex" => ToolKind::Codex,
         "opencode" => ToolKind::OpenCode,
+        "cursor" | "cursor-agent" => ToolKind::Cursor,
         _ => detect_kind_from_path(path).unwrap_or(ToolKind::Claude),
     }
 }
@@ -163,4 +172,30 @@ pub fn format_exchanges_pub(
     };
     let exchanges = read(Path::new(q.path), kind, &opts)?;
     Ok(format_exchanges(&exchanges, instance, full, q.detailed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_kind_from_path_routes_cursor_jsonl_via_agent_transcripts() {
+        // Cursor `.jsonl` keys off the agent-transcripts segment, not the
+        // extension (shared with Claude/Codex), so it no longer falls through
+        // to Claude.
+        assert_eq!(
+            detect_kind_from_path("/h/.cursor/projects/r/agent-transcripts/u/u.jsonl"),
+            Some(ToolKind::Cursor)
+        );
+        // A plain Claude `.jsonl` stays ambiguous (None → caller defaults).
+        assert_eq!(detect_kind_from_path("/h/.claude/projects/r/u.jsonl"), None);
+        assert_eq!(
+            detect_kind_from_path("/x/session.json"),
+            Some(ToolKind::Gemini)
+        );
+        assert_eq!(
+            detect_kind_from_path("/x/opencode.db"),
+            Some(ToolKind::OpenCode)
+        );
+    }
 }
