@@ -996,6 +996,7 @@ fn merge_resume_args(tool: &str, original: &[String], resume: &[String]) -> Vec<
         "cursor" => merge_cursor_args(original, resume),
         "kimi" => merge_kimi_args(original, resume),
         "copilot" => merge_copilot_args(original, resume),
+        "pi" => merge_pi_args(original, resume),
         _ => {
             // For unknown tools: resume args only.
             resume.to_vec()
@@ -1322,6 +1323,58 @@ fn merge_kimi_args(original: &[String], resume: &[String]) -> Vec<String> {
 
         preserved.push(token.clone());
         i += 1;
+    }
+
+    let mut merged = resume.to_vec();
+    merged.extend(preserved);
+    merged
+}
+
+/// Merge pi original launch args with resume args.
+///
+/// Strips session-control flags (`--session`/`--session-id`/`--session-dir`/
+/// `--fork`/`--continue`/`--resume`) and the positional initial prompt from the
+/// original launch args; preserves the rest (model flags, etc.). Resume args
+/// take precedence (prepended).
+fn merge_pi_args(original: &[String], resume: &[String]) -> Vec<String> {
+    let mut preserved = Vec::new();
+    let mut i = 0;
+
+    while i < original.len() {
+        let token = &original[i];
+        let token_str = token.as_str();
+
+        if matches!(
+            token_str,
+            "--session" | "--session-id" | "--session-dir" | "--fork"
+        ) {
+            i += 2;
+            continue;
+        }
+        if matches!(token_str, "--continue" | "--resume")
+            || token_str.starts_with("--session=")
+            || token_str.starts_with("--session-id=")
+            || token_str.starts_with("--session-dir=")
+            || token_str.starts_with("--fork=")
+        {
+            i += 1;
+            continue;
+        }
+
+        if !token_str.starts_with('-') {
+            // Pi initial prompts are positional; do not replay an old prompt
+            // when resuming or forking a session.
+            i += 1;
+            continue;
+        }
+
+        preserved.push(token.clone());
+        if i + 1 < original.len() && !original[i + 1].starts_with('-') {
+            preserved.push(original[i + 1].clone());
+            i += 2;
+        } else {
+            i += 1;
+        }
     }
 
     let mut merged = resume.to_vec();
@@ -1714,6 +1767,53 @@ fn find_session_on_disk(session_id: &str) -> Option<(String, Option<String>)> {
         return Some((tool, Some(path)));
     }
 
+    // 8. Pi
+    if let Some(path) = derive_pi_transcript_path(session_id) {
+        return Some(("pi".to_string(), Some(path)));
+    }
+
+    None
+}
+
+/// Locate a Pi transcript by session id under the configured session dir
+/// (`PI_CODING_AGENT_SESSION_DIR`) or the default `~/.pi/agent/sessions`.
+fn derive_pi_transcript_path(session_id: &str) -> Option<String> {
+    let mut roots = Vec::new();
+    if let Ok(dir) = std::env::var("PI_CODING_AGENT_SESSION_DIR")
+        && !dir.is_empty()
+    {
+        roots.push(std::path::PathBuf::from(dir));
+    }
+    roots.push(dirs::home_dir()?.join(".pi").join("agent").join("sessions"));
+
+    for root in roots {
+        if !root.exists() {
+            continue;
+        }
+        if let Some(path) = find_pi_transcript_in_root(&root, session_id) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn find_pi_transcript_in_root(root: &std::path::Path, session_id: &str) -> Option<String> {
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_pi_transcript_in_root(&path, session_id) {
+                return Some(found);
+            }
+        } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+            && path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|name| name.contains(session_id))
+        {
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
     None
 }
 
@@ -1826,6 +1926,15 @@ fn extract_cwd_from_transcript(path: &str, tool: &str) -> Option<String> {
                 .and_then(|data| data.get("cwd"))
                 .and_then(|cwd| cwd.as_str())
         }),
+        "pi" => scan_lines_for_cwd(path, 10, |v| {
+            if v.get("type").and_then(|t| t.as_str()) == Some("session") {
+                v.get("cwd")
+                    .or_else(|| v.get("session").and_then(|s| s.get("cwd")))
+                    .and_then(|c| c.as_str())
+            } else {
+                None
+            }
+        }),
         _ => None,
     }
 }
@@ -1927,7 +2036,9 @@ fn build_adopt_plan(
                  - Claude:   {claude}/*/{sid}.jsonl\n  \
                  - Codex:    ~/.codex/sessions/**/*-{sid}.jsonl\n  \
                  - Gemini:   ~/.gemini/tmp/*/chats/session-*-{short}*.json\n  \
-                 - Cursor:   ~/.cursor/projects/*/agent-transcripts/{sid}/{sid}.jsonl",
+                 - Cursor:   ~/.cursor/projects/*/agent-transcripts/{sid}/{sid}.jsonl\n  \
+                 - Copilot:  ~/.copilot/session-state/{sid}/events.jsonl\n  \
+                 - Pi:       ~/.pi/agent/sessions/**/*{sid}*.jsonl",
                 sid = session_id,
                 claude = claude_projects.display(),
                 short = session_id.split('-').next().unwrap_or(session_id),
@@ -2421,6 +2532,34 @@ mod tests {
     fn test_build_resume_args_kilo_fork() {
         let args = build_resume_args("kilo", "sess-000", true);
         assert_eq!(args, s(&["--session", "sess-000", "--fork"]));
+    }
+
+    #[test]
+    fn test_build_resume_args_pi_fork() {
+        let args = build_resume_args("pi", "sess-000", true);
+        assert_eq!(args, s(&["--session", "sess-000", "--fork"]));
+    }
+
+    #[test]
+    fn test_merge_resume_args_pi_strips_session_controls_and_positional_prompt() {
+        let merged = merge_resume_args(
+            "pi",
+            &s(&[
+                "--model",
+                "claude-3-5-sonnet",
+                "--session-id",
+                "old-sess",
+                "--session-dir",
+                "/tmp/old",
+                "--continue",
+                "old prompt",
+            ]),
+            &s(&["--session", "new-sess"]),
+        );
+        assert_eq!(
+            merged,
+            s(&["--session", "new-sess", "--model", "claude-3-5-sonnet"])
+        );
     }
 
     #[test]

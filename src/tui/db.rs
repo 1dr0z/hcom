@@ -244,6 +244,7 @@ fn parse_tool(s: &str) -> Tool {
         "antigravity" => Tool::Antigravity,
         "cursor" => Tool::Cursor,
         "kimi" => Tool::Kimi,
+        "copilot" => Tool::Copilot,
         _ => Tool::Adhoc,
     }
 }

@@ -134,6 +134,11 @@ pub fn is_inside_ai_tool() -> bool {
         // Kimi Code
         || is_eq("KIMI_CODE_CLI", "1")
         || is_set("KIMI_SESSION_ID")
+        // Copilot (hcom-launched; no stable native marker documented)
+        || is_eq("HCOM_TOOL", "copilot")
+        // Pi Coding Agent (hcom-launched marker)
+        || is_eq("HCOM_PI", "1")
+        || is_eq("HCOM_TOOL", "pi")
         // hcom-launched
         || is_eq("HCOM_LAUNCHED", "1")
 }
@@ -167,6 +172,10 @@ pub fn detect_current_tool_from_env() -> &'static str {
         "cursor"
     } else if is_eq("KIMI_CODE_CLI", "1") || is_set("KIMI_SESSION_ID") {
         "kimi"
+    } else if is_eq("HCOM_TOOL", "copilot") {
+        "copilot"
+    } else if is_eq("HCOM_PI", "1") || is_eq("HCOM_TOOL", "pi") {
+        "pi"
     } else {
         "adhoc"
     }

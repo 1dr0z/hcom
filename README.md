@@ -6,7 +6,7 @@
 
 > **Hook your coding agents together**
 
-`hcom` is a CLI that agents can use to message, watch, and spawn each other across terminals. It integrates with Claude Code, Gemini, Codex, OpenCode, Kilo Code, Antigravity, Cursor and Copilot without changing how you use them.
+`hcom` is a CLI that agents can use to message, watch, and spawn each other across terminals. It integrates with Claude Code, Gemini, Codex, OpenCode, Kilo Code, Pi, Antigravity, Cursor and Copilot without changing how you use them.
 
 Use it to coordinate pipelines, run different AI CLIs as each other's subagents, or just instead of copy-paste.
 
@@ -43,7 +43,7 @@ uv tool install hcom  # or: pip install hcom
 Terminal 1:
 
 ```bash
-hcom claude   # codex / gemini / opencode / kilo / agy / cursor-agent / kimi
+hcom claude   # codex / gemini / opencode / kilo / pi / agy / cursor-agent / kimi / copilot
 ```
 
 Terminal 2:
@@ -218,6 +218,7 @@ brew uninstall hcom          # or: rm $(which hcom)
 | Antigravity CLI | automatic | `hcom agy` |
 | OpenCode | automatic | `hcom opencode` |
 | Kilo Code | automatic | `hcom kilo` |
+| Pi | automatic | `hcom pi` |
 | Cursor CLI | automatic | `hcom cursor-agent` |
 | Copilot CLI | automatic | `hcom copilot` |
 | Anything else | manual via `hcom listen` | `hcom start` (run inside tool) |

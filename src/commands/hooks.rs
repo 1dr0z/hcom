@@ -105,7 +105,7 @@ fn cmd_hooks_add(argv: &[String]) -> i32 {
     } else {
         eprintln!("Error: Unknown tool: {}", argv[0]);
         eprintln!(
-            "Valid options: claude, gemini, codex, opencode, kilo, antigravity, cursor, kimi, all"
+            "Valid options: claude, gemini, codex, opencode, kilo, pi, antigravity, cursor, kimi, copilot, all"
         );
         return 1;
     };
@@ -195,7 +195,7 @@ pub fn cmd_hooks_remove(argv: &[String]) -> i32 {
     } else {
         eprintln!("Error: Unknown tool: {}", argv[0]);
         eprintln!(
-            "Valid options: claude, gemini, codex, opencode, kilo, antigravity, cursor, kimi, all"
+            "Valid options: claude, gemini, codex, opencode, kilo, pi, antigravity, cursor, kimi, copilot, all"
         );
         return 1;
     };
@@ -257,8 +257,8 @@ pub fn cmd_hooks(_db: &HcomDb, args: &HooksArgs, _ctx: Option<&CommandContext>) 
              Usage:\n  \
              hcom hooks                  Show hook status for all tools\n  \
              hcom hooks status           Same as above\n  \
-             hcom hooks add [tool]       Add hooks (claude|gemini|codex|opencode|kilo|antigravity|cursor|kimi|all)\n  \
-             hcom hooks remove [tool]    Remove hooks (claude|gemini|codex|opencode|kilo|antigravity|cursor|kimi|all)\n\n\
+             hcom hooks add [tool]       Add hooks (claude|gemini|codex|opencode|kilo|pi|antigravity|cursor|kimi|copilot|all)\n  \
+             hcom hooks remove [tool]    Remove hooks (claude|gemini|codex|opencode|kilo|pi|antigravity|cursor|kimi|copilot|all)\n\n\
              Examples:\n  \
              hcom hooks add claude       Add Claude Code hooks only\n  \
              hcom hooks add              Auto-detect tool or add all\n  \

@@ -11,6 +11,7 @@ pub mod cursor;
 pub mod gemini;
 pub mod kimi;
 pub mod opencode;
+pub mod pi;
 pub mod shared;
 
 use std::path::Path;
@@ -34,6 +35,7 @@ pub enum ToolKind {
     Cursor,
     Kimi,
     Copilot,
+    Pi,
 }
 
 /// Options for reading a transcript.
@@ -72,6 +74,7 @@ pub fn read(path: &Path, kind: ToolKind, opts: &ReadOptions) -> Result<Vec<Excha
         ToolKind::Cursor => cursor::parse_cursor_jsonl(path, opts.last, opts.detailed),
         ToolKind::Kimi => kimi::parse_kimi_wire_jsonl(path, opts.last, opts.detailed),
         ToolKind::Copilot => copilot::parse_copilot_jsonl(path, opts.last, opts.detailed),
+        ToolKind::Pi => pi::parse_pi_jsonl(path, opts.last, opts.detailed),
         ToolKind::OpenCode => {
             let sid = opts.session_id.as_deref().unwrap_or("");
             if sid.is_empty() {
@@ -110,6 +113,12 @@ pub fn detect_kind_from_path(path: &str) -> Option<ToolKind> {
         Some(ToolKind::Cursor)
     } else if path.contains("session-state") && path.ends_with("events.jsonl") {
         Some(ToolKind::Copilot)
+    } else if path.ends_with(".jsonl")
+        && (path.contains(".pi/agent/sessions")
+            || path.contains(".pi/sessions")
+            || path.to_lowercase().contains("pi_coding_agent_session"))
+    {
+        Some(ToolKind::Pi)
     } else {
         None
     }
@@ -126,6 +135,8 @@ pub fn kind_from_agent_or_path(agent: &str, path: &str) -> ToolKind {
         "opencode" | "kilo" => ToolKind::OpenCode,
         "cursor" | "cursor-agent" => ToolKind::Cursor,
         "kimi" => ToolKind::Kimi,
+        "copilot" => ToolKind::Copilot,
+        "pi" | "pi-agent" => ToolKind::Pi,
         _ => detect_kind_from_path(path).unwrap_or(ToolKind::Claude),
     }
 }

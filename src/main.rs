@@ -72,7 +72,9 @@ pub fn run_pty(args: &[String]) -> Result<()> {
         eprintln!();
         eprintln!("Usage: hcom pty <tool> [args...]");
         eprintln!();
-        eprintln!("Tools: claude, gemini, codex, opencode, kilo, antigravity (agy), cursor, kimi");
+        eprintln!(
+            "Tools: claude, gemini, codex, opencode, kilo, pi, antigravity (agy), cursor, kimi"
+        );
         eprintln!();
         eprintln!("The PTY wrapper provides:");
         eprintln!("  - Text injection via TCP port (INJECT_PORT)");

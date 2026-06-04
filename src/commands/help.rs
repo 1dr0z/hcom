@@ -187,11 +187,11 @@ const LIST_HELP: &[HelpEntry] = &[
     ("Tool labels:", ""),
     (
         "",
-        "[CLAUDE] [GEMINI] [CODEX] [OPENCODE] [KILO] [ANTIGRAVITY]  hcom-launched (PTY + hooks)",
+        "[CLAUDE] [GEMINI] [CODEX] [OPENCODE] [KILO] [PI] [ANTIGRAVITY] [CURSOR] [KIMI] [COPILOT]  hcom-launched (PTY + hooks)",
     ),
     (
         "",
-        "[claude] [gemini] [codex] [opencode] [kilo] [antigravity] [cursor] [kimi]  vanilla (hooks only)",
+        "[claude] [gemini] [codex] [opencode] [kilo] [pi] [antigravity] [cursor] [kimi] [copilot]  vanilla (hooks only)",
     ),
     ("", "[AD-HOC]                              manual polling"),
 ];
@@ -443,7 +443,7 @@ const RESET_HELP: &[HelpEntry] = &[
     ),
     (
         "",
-        "  HCOM_DIR=$PWD/.hcom -> $PWD/.claude, .gemini, .codex, .opencode, .kilo, .antigravity, .cursor, .kimi",
+        "  HCOM_DIR=$PWD/.hcom -> $PWD/.claude, .gemini, .codex, .opencode, .kilo, .pi, .antigravity, .cursor, .kimi, .copilot",
     ),
     ("", ""),
     ("", "To remove local setup:"),
@@ -477,7 +477,7 @@ const CONFIG_HELP: &[HelpEntry] = &[
         "Subagent keep-alive seconds after task",
     ),
     (
-        "  claude_args / gemini_args / codex_args / opencode_args / kilo_args / cursor_args / kimi_args",
+        "  claude_args / gemini_args / codex_args / opencode_args / kilo_args / pi_args / cursor_args / kimi_args / copilot_args",
         "",
     ),
     ("  auto_approve", "Auto-approve safe hcom commands"),
@@ -545,7 +545,7 @@ const TRANSCRIPT_HELP: &[HelpEntry] = &[
     ("  --limit N", "Max results (default: 20)"),
     (
         "  --agent TYPE",
-        "Filter: claude | gemini | codex | opencode | kilo | kimi",
+        "Filter: claude | gemini | codex | opencode | kilo | pi | kimi | copilot",
     ),
     (
         "  --exclude-self",
@@ -613,11 +613,11 @@ const HOOKS_HELP: &[HelpEntry] = &[
     ("hooks status", "Same as above"),
     (
         "hooks add [tool]",
-        "Add hooks (claude | gemini | codex | opencode | kilo | antigravity | cursor | kimi | all)",
+        "Add hooks (claude | gemini | codex | opencode | kilo | pi | antigravity | cursor | kimi | copilot | all)",
     ),
     (
         "hooks remove [tool]",
-        "Remove hooks (claude | gemini | codex | opencode | kilo | antigravity | cursor | kimi | all)",
+        "Remove hooks (claude | gemini | codex | opencode | kilo | pi | antigravity | cursor | kimi | copilot | all)",
     ),
     ("", ""),
     (
@@ -876,7 +876,7 @@ Usage:\n\
 Launch:\n\
   hcom [N] claude|gemini|codex|opencode|kilo|pi|agy|cursor-agent|kimi|copilot [flags] [tool-args]\n\
   hcom r <name>                         Resume stopped agent\n\
-  hcom f <name>                         Fork agent session (claude/codex/opencode/kilo/kimi)\n\
+  hcom f <name>                         Fork agent session (claude/codex/opencode/kilo/pi/kimi)\n\
   hcom kill <name(s)|tag:T|all>         Kill + close terminal pane\n\
 \n\
 Commands:\n\
@@ -964,7 +964,7 @@ pub fn get_command_help(name: &str) -> String {
             "Adopting by UUID or thread-name reclaims the original hcom\n\
              identity if one existed; otherwise a new identity is assigned.\n\
              CWD is recovered from the session's transcript/DB.",
-            "hcom f <target>                   Fork an agent session (claude/codex/opencode/kilo/kimi)",
+            "hcom f <target>                   Fork an agent session (claude/codex/opencode/kilo/pi/kimi)",
         );
     }
     if name == "f" || name == "fork" {
@@ -1164,9 +1164,11 @@ mod tests {
     #[test]
     fn top_level_help_scopes_fork_to_supported_tools() {
         let help = get_help_text();
-        assert!(help.contains("claude|gemini|codex|opencode|kilo|pi|agy|cursor-agent|kimi|copilot"));
+        assert!(
+            help.contains("claude|gemini|codex|opencode|kilo|pi|agy|cursor-agent|kimi|copilot")
+        );
         assert!(help.contains(
-            "hcom f <name>                         Fork agent session (claude/codex/opencode/kilo/kimi)"
+            "hcom f <name>                         Fork agent session (claude/codex/opencode/kilo/pi/kimi)"
         ));
     }
 }

@@ -63,10 +63,10 @@ You MUST use `hcom <cmd+flags> --name {instance_name}` for all hcom commands:
   Filters (same flag=OR, different=AND): --agent NAME | --type message|status|life | --status listening|active|blocked | --cmd PATTERN (contains, ^prefix, =exact) | --file PATH (*.py for glob, file.py for contains)
   Event-based notifications, watch agents, subscribe, react: events sub [filters] | --help
 - Handoff context: bundle prepare
-- Spawn agents: [num] <claude|gemini|codex|opencode|kilo|antigravity|agy|cursor|kimi> [--tag labelOrGroup] [--terminal tmux|kitty|wezterm|etc]
+- Spawn agents: [num] <claude|gemini|codex|opencode|kilo|pi|antigravity|agy|cursor|kimi|copilot> [--tag labelOrGroup] [--terminal tmux|kitty|wezterm|etc]
   Example: `hcom 1 claude --tag cool` -> automatic <hcom> msg when ready -> send it task via hcom send
   Resume: hcom r <name> [args] | Fork: hcom f <name> [args] | Kill: hcom kill <name(s)>
-  background, set prompt, system, forward args: <claude|gemini|codex|opencode|kilo|agy|cursor|kimi> --help
+  background, set prompt, system, forward args: <claude|gemini|codex|opencode|kilo|pi|agy|cursor|kimi> --help
 - Run workflows: run <script> [args] [--help]
   {scripts}
 - View agent screen: term [name] | inject text/enter: term inject <name> ['text'] [--enter]
@@ -454,7 +454,8 @@ pub fn get_bootstrap(
             || tool == "opencode"
             || tool == "kilo"
             || tool == "antigravity"
-            || tool == "kimi")
+            || tool == "kimi"
+            || tool == "pi")
             && ctx.is_launched)
     {
         parts.push(DELIVERY_AUTO);
