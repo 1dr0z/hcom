@@ -48,19 +48,32 @@ enum PendingEscape {
     /// Incomplete string sequence (OSC 3+, DCS, PM, APC) — complete when BEL (0x07)
     /// or ST (ESC \) appears. Title OSCs (0/1/2) are stripped by TitleOscFilter.
     StringSeq,
+    /// Incomplete single-shift (SS2 `ESC N` / SS3 `ESC O`) — consumes exactly one
+    /// following byte; complete as soon as any byte follows.
+    SingleShift,
+    /// Incomplete nF escape (`ESC` + intermediate bytes 0x20-0x2F, e.g. charset
+    /// designation `ESC ( B`) — complete when a final byte 0x30-0x7E appears.
+    NfSeq,
 }
 
 /// Check if it's safe to write title OSC to stdout.
 ///
-/// Three guards prevent corruption from interleaving with tool output:
-/// 1. `had_pty_output` — no PTY data this poll iteration (same-iteration guard)
-/// 2. `pending_utf8` — no incomplete UTF-8 multi-byte sequence (cross-iteration)
-/// 3. `pending_escape` — no incomplete CSI/OSC escape sequence on stdout
-///    (cross-iteration guard for escape sequences, which are all-ASCII
-///    and invisible to pending_utf8)
+/// The title OSC (1/2) is appended right after this iteration's coalesced PTY
+/// write, on the same single-threaded stdout (the delivery thread never writes
+/// stdout). OSC 1/2 set only window-title metadata — they don't touch the grid
+/// or cursor — so interleaving them *between complete sequences* mid-frame is
+/// safe. The only corruption risk is splitting an *incomplete* sequence, which
+/// these two guards rule out:
+/// - `pending_utf8` — no incomplete UTF-8 multi-byte sequence
+/// - `pending_escape` — buffer doesn't end inside an incomplete escape sequence
+///   (CSI, OSC/DCS/PM/APC string, single-shift, or nF) — see [`has_pending_escape`]
+///
+/// We deliberately do *not* gate on "no PTY output this iteration": a
+/// continuously-rendering TUI (e.g. pi during a turn) never yields a quiet
+/// iteration, which starved status-icon title updates entirely.
 #[inline]
-fn title_write_safe(had_pty_output: bool, pending_utf8: u8, pending_escape: PendingEscape) -> bool {
-    !had_pty_output && pending_utf8 == 0 && pending_escape == PendingEscape::None
+fn title_write_safe(pending_utf8: u8, pending_escape: PendingEscape) -> bool {
+    pending_utf8 == 0 && pending_escape == PendingEscape::None
 }
 
 /// Detect the submit edge from input text snapshots.
@@ -179,8 +192,8 @@ fn has_pending_escape(data: &[u8]) -> PendingEscape {
             }
             PendingEscape::StringSeq
         }
-        b'P' | b'^' | b'_' => {
-            // DCS / PM / APC: terminated by ST (ESC \)
+        b'P' | b'^' | b'_' | b'X' => {
+            // DCS / PM / APC / SOS: terminated by ST (ESC \)
             let content = &after[1..];
             let mut i = 0;
             while i < content.len() {
@@ -191,8 +204,27 @@ fn has_pending_escape(data: &[u8]) -> PendingEscape {
             }
             PendingEscape::StringSeq
         }
+        b'N' | b'O' => {
+            // SS2 / SS3 single-shift: consume exactly one following byte
+            if after.len() >= 2 {
+                PendingEscape::None
+            } else {
+                PendingEscape::SingleShift
+            }
+        }
+        0x20..=0x2F => {
+            // nF escape (e.g. charset designation `ESC ( B`, `ESC # 8`):
+            // ESC, one or more intermediate bytes 0x20-0x2F, then a final 0x30-0x7E.
+            for &b in after {
+                if !(0x20..=0x2F).contains(&b) {
+                    // Final byte (or an aborting control) — sequence resolved
+                    return PendingEscape::None;
+                }
+            }
+            PendingEscape::NfSeq
+        }
         _ => {
-            // Simple 2-byte escape (ESC + letter) — always complete
+            // Simple 2-byte escape (ESC + final byte 0x30-0x7E) — always complete
             PendingEscape::None
         }
     }
@@ -204,6 +236,8 @@ fn has_pending_escape(data: &[u8]) -> PendingEscape {
 /// has no new ESC, check whether a type-appropriate terminator appears:
 /// - CSI: any byte in 0x40-0x7E (the final byte)
 /// - StringSeq: BEL (0x07) — ST (ESC \) requires ESC, handled by caller
+/// - SingleShift: any single byte completes the shift
+/// - NfSeq: a final byte 0x30-0x7E
 #[inline]
 fn resolve_pending_escape(pending: PendingEscape, data: &[u8]) -> PendingEscape {
     match pending {
@@ -220,6 +254,22 @@ fn resolve_pending_escape(pending: PendingEscape, data: &[u8]) -> PendingEscape 
                 PendingEscape::None
             } else {
                 PendingEscape::StringSeq
+            }
+        }
+        PendingEscape::SingleShift => {
+            // Any single following byte completes the shift.
+            if data.is_empty() {
+                PendingEscape::SingleShift
+            } else {
+                PendingEscape::None
+            }
+        }
+        PendingEscape::NfSeq => {
+            // Complete once a final byte (0x30-0x7E) appears.
+            if data.iter().any(|&b| (0x30..=0x7E).contains(&b)) {
+                PendingEscape::None
+            } else {
+                PendingEscape::NfSeq
             }
         }
     }
@@ -748,10 +798,6 @@ impl Proxy {
         // Stateful title OSC filter — strips tool's title sequences across read boundaries
         let mut title_filter = TitleOscFilter::new();
 
-        // Title writes deferred to iterations with NO PTY output, preventing interleaving
-        // with any incomplete escape sequence (CSI, OSC, UTF-8, etc.).
-        let mut had_pty_output: bool;
-
         // Whether to include stdin in the poll set. Set to false when stdin is a non-TTY
         // that reaches EOF (e.g. /dev/null in headless mode), to avoid busy-waiting.
         let mut poll_stdin = true;
@@ -782,8 +828,6 @@ impl Proxy {
         };
 
         loop {
-            had_pty_output = false;
-
             // Handle signals
             if SIGWINCH_RECEIVED.swap(false, Ordering::AcqRel) {
                 self.forward_winsize()?;
@@ -972,7 +1016,6 @@ impl Proxy {
                     // Single write of all coalesced data
                     if !coalesced.is_empty() {
                         write_all(&stdout_fd, &coalesced)?;
-                        had_pty_output = true;
                         pending_utf8 = pending_utf8_bytes(&coalesced);
                         pending_escape = if coalesced.contains(&0x1b) {
                             has_pending_escape(&coalesced)
@@ -1139,14 +1182,13 @@ impl Proxy {
                 }
             }
 
-            // Check for title changes (delivery thread updates shared Arcs)
-            // Writing here ensures title OSC is serialized with PTY output, preventing interleaving
-            //
-            // Only write title when this iteration had NO PTY output. This prevents
-            // interleaving with any incomplete escape sequence (CSI, UTF-8, etc.).
-            // pending_utf8 catches cross-iteration incomplete UTF-8 (e.g., title-only
-            // read after a read that ended with partial multi-byte char).
-            if stdout_is_tty && title_write_safe(had_pty_output, pending_utf8, pending_escape) {
+            // Check for title changes (delivery thread updates shared Arcs).
+            // Writing here serializes the title OSC with PTY output on the same
+            // thread. We append it right after this iteration's coalesced write,
+            // but only when that write left no incomplete UTF-8 or escape sequence
+            // (`title_write_safe`) — splitting one would corrupt the stream.
+            // pending_utf8/pending_escape carry that state across read boundaries.
+            if stdout_is_tty && title_write_safe(pending_utf8, pending_escape) {
                 let (name, status) = {
                     let n = self
                         .current_name
@@ -1950,33 +1992,41 @@ mod tests {
     use super::{PendingEscape, has_pending_escape, resolve_pending_escape, title_write_safe};
 
     #[test]
-    fn test_title_write_blocked_by_pty_output() {
-        assert!(!title_write_safe(true, 0, PendingEscape::None));
+    fn test_title_write_allowed_during_clean_output() {
+        // A continuously-rendering tool (pi) only ever yields clean-boundary
+        // writes; the title must be writable on those, not gated on a quiet
+        // iteration. Clean boundary == no pending utf8/escape.
+        assert!(title_write_safe(0, PendingEscape::None));
     }
 
     #[test]
     fn test_title_write_blocked_by_pending_utf8() {
-        assert!(!title_write_safe(false, 1, PendingEscape::None));
+        assert!(!title_write_safe(1, PendingEscape::None));
     }
 
     #[test]
     fn test_title_write_blocked_by_pending_csi() {
-        assert!(!title_write_safe(false, 0, PendingEscape::Csi));
+        assert!(!title_write_safe(0, PendingEscape::Csi));
     }
 
     #[test]
     fn test_title_write_blocked_by_pending_string_seq() {
-        assert!(!title_write_safe(false, 0, PendingEscape::StringSeq));
+        assert!(!title_write_safe(0, PendingEscape::StringSeq));
     }
 
     #[test]
-    fn test_title_write_safe_when_all_clear() {
-        assert!(title_write_safe(false, 0, PendingEscape::None));
+    fn test_title_write_blocked_by_pending_single_shift() {
+        assert!(!title_write_safe(0, PendingEscape::SingleShift));
+    }
+
+    #[test]
+    fn test_title_write_blocked_by_pending_nf_seq() {
+        assert!(!title_write_safe(0, PendingEscape::NfSeq));
     }
 
     #[test]
     fn test_title_write_blocked_by_multiple_conditions() {
-        assert!(!title_write_safe(true, 2, PendingEscape::Csi));
+        assert!(!title_write_safe(2, PendingEscape::Csi));
     }
 
     // ---- has_pending_escape tests ----
@@ -2059,6 +2109,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_pending_escape_incomplete_single_shift() {
+        // SS2 (ESC N) / SS3 (ESC O) with no following byte yet
+        assert_eq!(has_pending_escape(b"text\x1bN"), PendingEscape::SingleShift);
+        assert_eq!(has_pending_escape(b"text\x1bO"), PendingEscape::SingleShift);
+    }
+
+    #[test]
+    fn test_pending_escape_complete_single_shift() {
+        // The shifted character completes the sequence
+        assert_eq!(has_pending_escape(b"\x1bNx"), PendingEscape::None);
+        assert_eq!(has_pending_escape(b"\x1bOx"), PendingEscape::None);
+    }
+
+    #[test]
+    fn test_pending_escape_incomplete_nf() {
+        // nF charset designation mid-sequence (intermediate, no final yet)
+        assert_eq!(has_pending_escape(b"text\x1b("), PendingEscape::NfSeq);
+        assert_eq!(has_pending_escape(b"text\x1b#"), PendingEscape::NfSeq);
+    }
+
+    #[test]
+    fn test_pending_escape_complete_nf() {
+        // ESC ( B (designate ASCII to G0), ESC # 8 (DEC alignment test)
+        assert_eq!(has_pending_escape(b"\x1b(B"), PendingEscape::None);
+        assert_eq!(has_pending_escape(b"\x1b#8"), PendingEscape::None);
+    }
+
     // ---- resolve_pending_escape (cross-chunk) tests ----
 
     #[test]
@@ -2121,6 +2199,34 @@ mod tests {
         assert_eq!(
             resolve_pending_escape(PendingEscape::StringSeq, b"https://example"),
             PendingEscape::StringSeq
+        );
+    }
+
+    #[test]
+    fn test_resolve_single_shift_completes_on_any_byte() {
+        // The shifted char arrives in the next chunk (split between ESC N and char)
+        assert_eq!(
+            resolve_pending_escape(PendingEscape::SingleShift, b"xrest"),
+            PendingEscape::None
+        );
+        // Empty continuation keeps it pending
+        assert_eq!(
+            resolve_pending_escape(PendingEscape::SingleShift, b""),
+            PendingEscape::SingleShift
+        );
+    }
+
+    #[test]
+    fn test_resolve_nf_continuation() {
+        // Intermediates only — stays pending
+        assert_eq!(
+            resolve_pending_escape(PendingEscape::NfSeq, b"  "),
+            PendingEscape::NfSeq
+        );
+        // Final byte (0x30-0x7E) completes it
+        assert_eq!(
+            resolve_pending_escape(PendingEscape::NfSeq, b"B"),
+            PendingEscape::None
         );
     }
 
