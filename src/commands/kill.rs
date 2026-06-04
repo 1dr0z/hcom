@@ -49,6 +49,7 @@ fn normalize_kill_result(
     name: &str,
     pid: u32,
     result: terminal::KillResult,
+    pane_closed: bool,
 ) -> terminal::KillResult {
     if !matches!(result, terminal::KillResult::PermissionDenied) {
         return result;
@@ -63,6 +64,18 @@ fn normalize_kill_result(
             name, pid
         ),
     );
+    if pane_closed {
+        log_info(
+            "kill",
+            "kill.eperm_resolved",
+            &format!(
+                "name={} pid={} resolved to already_dead because terminal pane closed",
+                name, pid_str
+            ),
+        );
+        return terminal::KillResult::AlreadyDead;
+    }
+
     std::thread::sleep(EPERM_RECHECK_DELAY);
     if !pidtrack::is_alive(pid) {
         log_info(
@@ -311,6 +324,7 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
         );
         let names = orphan.names.join(", ");
         let pane_info = pane_info_str(pane_closed, &orphan.terminal_preset, &orphan.pane_id);
+        let result = normalize_kill_result(&names, orphan.pid, result, pane_closed);
         let label = if !names.is_empty() || !pane_info.is_empty() {
             format!(" ({}{})", names, pane_info)
         } else {
@@ -329,6 +343,7 @@ fn kill_all(db: &HcomDb, hcom_dir: &std::path::Path, initiator: &str) -> Result<
                     "Orphan process group {} already terminated{}",
                     orphan.pid, label
                 );
+                killed += 1;
             }
             terminal::KillResult::PermissionDenied => {
                 failed += 1;
@@ -381,6 +396,7 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
                         "Process group {} already terminated for '{}'",
                         pid, inst.name
                     );
+                    killed += 1;
                 }
                 terminal::KillResult::PermissionDenied => {
                     eprintln!(
@@ -416,6 +432,7 @@ fn kill_by_tag(db: &HcomDb, hcom_dir: &std::path::Path, tag: &str, initiator: &s
             &orphan.terminal_id,
             &orphan.zellij_session_name,
         );
+        let result = normalize_kill_result(&names, orphan.pid, result, pane_closed);
         let pane_info = pane_info_str(pane_closed, &orphan.terminal_preset, &orphan.pane_id);
         match result {
             terminal::KillResult::Sent => {
@@ -479,6 +496,7 @@ fn kill_single(
                     &orphan.terminal_id,
                     &orphan.zellij_session_name,
                 );
+                let result = normalize_kill_result(target, orphan.pid, result, pane_closed);
                 let pane_info =
                     pane_info_str(pane_closed, &orphan.terminal_preset, &orphan.pane_id);
                 match result {
@@ -578,7 +596,7 @@ fn kill_instance(
     // Headless instances have no terminal pane — skip pane close
     if is_headless {
         let (result, pane_closed) = terminal::kill_process(pid, "", "", "", "", "", "");
-        let result = normalize_kill_result(name, pid, result);
+        let result = normalize_kill_result(name, pid, result, pane_closed);
         log_info(
             "kill",
             "lifecycle.kill",
@@ -604,7 +622,7 @@ fn kill_instance(
         &ti.terminal_id,
         &ti.zellij_session_name,
     );
-    let result = normalize_kill_result(name, pid, result);
+    let result = normalize_kill_result(name, pid, result, pane_closed);
 
     log_info(
         "kill",
@@ -656,6 +674,13 @@ mod tests {
         use clap::Parser;
         let args = KillArgs::try_parse_from(["kill"]).unwrap();
         assert!(args.targets.is_empty());
+    }
+
+    #[test]
+    fn test_normalize_permission_denied_after_pane_close_succeeds() {
+        let result =
+            normalize_kill_result("luna", 42, terminal::KillResult::PermissionDenied, true);
+        assert_eq!(result, terminal::KillResult::AlreadyDead);
     }
 
     #[test]
