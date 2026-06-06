@@ -163,12 +163,10 @@ fn flag_tokens(line: &str) -> Vec<String> {
         .filter_map(|raw| {
             let token = raw
                 .trim()
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .trim_end_matches(',')
                 .split('=')
                 .next()
-                .unwrap_or("");
+                .unwrap_or("")
+                .trim_matches(|c| c == '[' || c == ']' || c == ',');
             let is_long = token.starts_with("--")
                 && token[2..]
                     .chars()
@@ -487,7 +485,7 @@ fn installed_opencode_help_crawls_but_hcom_keeps_opencode_args_pass_through() {
         .iter()
         .map(|option| option.token.as_str())
         .collect::<BTreeSet<_>>();
-    for token in ["--agent", "--model", "-m"] {
+    for token in ["--agent", "--model", "-m", "--session", "--fork"] {
         assert!(
             root_option_tokens.contains(token),
             "hcom observes OpenCode launch arg {token}, but installed opencode root help does not list it"
@@ -512,8 +510,8 @@ fn installed_opencode_help_crawls_but_hcom_keeps_opencode_args_pass_through() {
         "OpenCode has no hcom parser table; if validation is added, add opencode to this drift guard"
     );
     assert!(
-        launch_command.contains("_ => cli_args.to_vec(), // OpenCode-family tools: pass through"),
-        "OpenCode launch args should remain pass-through unless an opencode parser drift guard is added"
+        launch_command.contains("\"opencode\" | \"kilo\" | \"kilocode\" | \"kimi\" => {"),
+        "OpenCode launch args should support env config args merge"
     );
 }
 
@@ -530,7 +528,7 @@ fn installed_kilo_help_crawls_but_hcom_keeps_kilo_args_pass_through() {
         .iter()
         .map(|option| option.token.as_str())
         .collect::<BTreeSet<_>>();
-    for token in ["--agent", "--model", "-m"] {
+    for token in ["--agent", "--model", "-m", "--session", "--fork"] {
         assert!(
             root_option_tokens.contains(token),
             "hcom observes Kilo launch arg {token}, but installed kilo root help does not list it"
@@ -557,8 +555,8 @@ fn installed_kilo_help_crawls_but_hcom_keeps_kilo_args_pass_through() {
         "Kilo has no hcom parser table; if validation is added, add kilo to this drift guard"
     );
     assert!(
-        launch_command.contains("_ => cli_args.to_vec(), // OpenCode-family tools: pass through"),
-        "Kilo launch args should remain pass-through unless a kilo parser drift guard is added"
+        launch_command.contains("\"opencode\" | \"kilo\" | \"kilocode\" | \"kimi\" => {"),
+        "Kilo launch args should support env config args merge"
     );
 }
 
@@ -574,7 +572,15 @@ fn installed_pi_help_crawls_and_hcom_keeps_pi_args_append_only() {
         .iter()
         .map(|option| option.token.as_str())
         .collect::<BTreeSet<_>>();
-    for token in ["--model", "-m"] {
+    for token in [
+        "--model",
+        "--session",
+        "--session-id",
+        "--session-dir",
+        "--fork",
+        "--continue",
+        "--resume",
+    ] {
         assert!(
             root_option_tokens.contains(token),
             "hcom observes Pi launch arg {token}, but installed pi root help does not list it"
@@ -602,4 +608,121 @@ fn installed_pi_help_crawls_and_hcom_keeps_pi_args_append_only() {
         ),
         "Pi should stay parser-validation free unless a pi parser drift guard is added"
     );
+}
+
+#[test]
+#[ignore = "manual release drift guard: requires installed upstream CLIs on PATH"]
+fn installed_copilot_help_crawls_and_hcom_keeps_copilot_args_append_only() {
+    let pages = collect_help_pages("copilot", CommandStyle::Bare, 0);
+    let root_options = option_tokens(&pages[0]);
+    assert!(
+        !root_options.is_empty(),
+        "copilot help crawl found no options"
+    );
+    let root_option_tokens = root_options
+        .iter()
+        .map(|option| option.token.as_str())
+        .collect::<BTreeSet<_>>();
+    for token in [
+        "--model",
+        "--name",
+        "--add-dir",
+        "--agent",
+        "--resume",
+        "-i",
+        "--interactive",
+        "--allow-all-tools",
+        "--allow-all",
+        "--yolo",
+    ] {
+        assert!(
+            root_option_tokens.contains(token),
+            "hcom observes Copilot launch arg {token}, but installed copilot root help does not list it"
+        );
+    }
+}
+
+#[test]
+#[ignore = "manual release drift guard: requires installed upstream CLIs on PATH"]
+fn installed_cursor_help_crawls_and_hcom_keeps_cursor_args_append_only() {
+    let pages = collect_help_pages("cursor-agent", CommandStyle::Bare, 0);
+    let root_options = option_tokens(&pages[0]);
+    assert!(
+        !root_options.is_empty(),
+        "cursor help crawl found no options"
+    );
+    let root_option_tokens = root_options
+        .iter()
+        .map(|option| option.token.as_str())
+        .collect::<BTreeSet<_>>();
+    for token in [
+        "--api-key",
+        "--header",
+        "-H",
+        "--output-format",
+        "--mode",
+        "--model",
+        "--sandbox",
+        "--plugin-dir",
+        "--resume",
+        "--workspace",
+        "--worktree",
+        "-w",
+        "--worktree-base",
+        "--continue",
+        "--skip-worktree-setup",
+        "-p",
+        "--print",
+        "--stream-partial-output",
+    ] {
+        assert!(
+            root_option_tokens.contains(token),
+            "hcom observes Cursor launch arg {token}, but installed cursor root help does not list it"
+        );
+    }
+}
+
+#[test]
+#[ignore = "manual release drift guard: requires installed upstream CLIs on PATH"]
+fn installed_agy_help_crawls_and_hcom_keeps_agy_args_append_only() {
+    let pages = collect_help_pages("agy", CommandStyle::Bare, 0);
+    let root_options = option_tokens(&pages[0]);
+    assert!(!root_options.is_empty(), "agy help crawl found no options");
+    let root_option_tokens = root_options
+        .iter()
+        .map(|option| option.token.as_str())
+        .collect::<BTreeSet<_>>();
+    for token in [
+        "--conversation",
+        "--continue",
+        "-c",
+        "--prompt",
+        "--prompt-interactive",
+        "-i",
+        "--print",
+        "-p",
+    ] {
+        assert!(
+            root_option_tokens.contains(token),
+            "hcom observes Antigravity launch arg {token}, but installed agy root help does not list it"
+        );
+    }
+}
+
+#[test]
+#[ignore = "manual release drift guard: requires installed upstream CLIs on PATH"]
+fn installed_kimi_help_crawls_and_hcom_keeps_kimi_args_append_only() {
+    let pages = collect_help_pages("kimi", CommandStyle::Bare, 0);
+    let root_options = option_tokens(&pages[0]);
+    assert!(!root_options.is_empty(), "kimi help crawl found no options");
+    let root_option_tokens = root_options
+        .iter()
+        .map(|option| option.token.as_str())
+        .collect::<BTreeSet<_>>();
+    for token in ["--session"] {
+        assert!(
+            root_option_tokens.contains(token),
+            "hcom observes Kimi launch arg {token}, but installed kimi root help does not list it"
+        );
+    }
 }

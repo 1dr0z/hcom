@@ -786,8 +786,8 @@ pub static KIMI: IntegrationSpec = IntegrationSpec {
         background: BackgroundMode::HeadlessPty,
     },
     resume: Some(ResumeSpec {
-        // `-r/--resume` is a documented alias of `--session <id>`.
-        resume: ResumeArgs::Flag("--resume"),
+        // Use --session as it is the documented flag in kimi --help.
+        resume: ResumeArgs::Flag("--session"),
         // Kimi has no CLI fork primitive — `/fork` is an interactive slash
         // command only (`kimi --fork` errors "unknown option"). Like
         // gemini/cursor/agy, leave fork unsupported.
