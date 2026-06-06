@@ -2575,8 +2575,12 @@ mod tests {
 
     #[test]
     fn test_build_resume_args_pi_fork() {
+        // Pi's `--fork <id>` takes the id as its value and is mutually exclusive
+        // with `--session` (pi errors "--fork cannot be combined with
+        // --session"), so fork must emit `["--fork", <id>]`, not
+        // `["--session", <id>, "--fork"]`.
         let args = build_resume_args("pi", "sess-000", true);
-        assert_eq!(args, s(&["--session", "sess-000", "--fork"]));
+        assert_eq!(args, s(&["--fork", "sess-000"]));
     }
 
     #[test]

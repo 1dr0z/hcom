@@ -968,14 +968,14 @@ pub fn get_command_help(name: &str) -> String {
             "Adopting by UUID or thread-name reclaims the original hcom\n\
              identity if one existed; otherwise a new identity is assigned.\n\
              CWD is recovered from the session's transcript/DB.",
-            "hcom f <target>                   Fork an agent session (claude/codex/opencode/kilo/pi/kimi)",
+            "hcom f <target>                   Fork an agent session (claude/codex/opencode/kilo/pi)",
         );
     }
     if name == "f" || name == "fork" {
         return resume_fork_help(
             "hcom f <target> [tool-args...]    Fork an agent session (active or stopped)",
             "Creates a new agent that continues from the forked session.\n\
-             Supported tools: claude, codex, opencode, kilo, kimi. (gemini does not fork.)\n\
+             Supported tools: claude, codex, opencode, kilo, pi. (gemini/kimi do not fork.)\n\
              Remote fork (`:<device>`) requires --dir to pin the target cwd.",
             "hcom r <target>                   Resume a stopped agent",
         );

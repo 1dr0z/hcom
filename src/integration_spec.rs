@@ -845,7 +845,12 @@ pub static PI: IntegrationSpec = IntegrationSpec {
     },
     resume: Some(ResumeSpec {
         resume: ResumeArgs::Flag("--session"),
-        fork: Some(ForkArgs::AppendFlag("--fork")),
+        // Pi's `--fork <id>` takes the session id as its value and is mutually
+        // exclusive with `--session` ("--fork cannot be combined with
+        // --session"). Use Subcommand so build_resume_args emits
+        // `["--fork", <id>]` (replacing `--session`), not `["--session", <id>,
+        // "--fork"]` which pi rejects.
+        fork: Some(ForkArgs::Subcommand("--fork")),
     }),
     help: HelpSpec {
         unique_examples: PI_HELP_EXAMPLES,

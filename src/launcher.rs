@@ -1078,6 +1078,12 @@ fn launch_pty_or_background(
 /// - Name held by an inactive row → consume the row (delete) and return Ok(()).
 ///   An inactive row is a resume handle from agy soft-finalize; launch will
 ///   re-create a fresh row with the same name.
+/// - Name held by a `pending` placeholder reservation → Ok(()) without
+///   deleting. This is *our own* reservation: the fork/resume path calls
+///   `reserve_generated_name` (under flock, against an unused name) before the
+///   launch, then passes that name as `params.name`. The pre-register step
+///   (`initialize_instance_in_position_file`) promotes the placeholder in
+///   place, so it must survive — bailing here broke every tracked `hcom f`.
 /// - Name held by anything else (listening/active/blocked) → Err.
 fn resolve_explicit_name_conflict(db: &HcomDb, name: &str) -> Result<()> {
     let Some(row) = db.get_instance(name).ok().flatten() else {
@@ -1088,6 +1094,23 @@ fn resolve_explicit_name_conflict(db: &HcomDb, name: &str) -> Result<()> {
         db.delete_instance(name).map_err(|e| {
             anyhow::anyhow!("Failed to clear inactive resume row '{}': {}", name, e)
         })?;
+        return Ok(());
+    }
+    // A pending placeholder with no session yet is a reservation, not a live
+    // agent — leave it for the launcher's pre-register promotion.
+    let status_context = row
+        .get("status_context")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let session_empty = row
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.is_empty())
+        .unwrap_or(true);
+    if status == instance_names::PLACEHOLDER_STATUS
+        && status_context == instance_names::PLACEHOLDER_CONTEXT
+        && session_empty
+    {
         return Ok(());
     }
     bail!(
@@ -2596,6 +2619,30 @@ mod tests {
         assert!(resolve_explicit_name_conflict(&db, "zeno").is_ok());
         // Row must be gone so the launcher can create a fresh row with the same name.
         assert!(db.get_instance("zeno").unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_explicit_name_conflict_allows_pending_placeholder() {
+        // A pending placeholder is the fork/resume path's own reservation
+        // (reserve_generated_name). It must pass through so the launcher's
+        // pre-register step can promote it — bailing here broke `hcom f`.
+        let db = launcher_test_db();
+        let now = chrono::Utc::now().timestamp() as f64;
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, status, status_context, created_at, tool) \
+                 VALUES (?1, ?2, ?3, ?4, 'claude')",
+                rusqlite::params![
+                    "milo",
+                    instance_names::PLACEHOLDER_STATUS,
+                    instance_names::PLACEHOLDER_CONTEXT,
+                    now
+                ],
+            )
+            .unwrap();
+        assert!(resolve_explicit_name_conflict(&db, "milo").is_ok());
+        // Row must survive — the launcher promotes it in place.
+        assert!(db.get_instance("milo").unwrap().is_some());
     }
 
     #[test]
