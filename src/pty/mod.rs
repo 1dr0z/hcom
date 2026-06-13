@@ -36,7 +36,7 @@ use crate::db::HcomDb;
 use crate::delivery::{DeliveryState, ScreenState, ToolConfig, run_delivery_loop};
 use crate::log::{log_error, log_info, log_warn};
 use crate::notify::NotifyServer;
-use crate::shared::status_icon;
+use crate::shared::{ST_BLOCKED, ST_LISTENING, status_icon};
 use crate::tool::Tool;
 
 /// Identity of the process wrapped by the PTY.
@@ -1133,24 +1133,30 @@ impl Proxy {
                             poll_stdin = false;
                         }
                         Ok(n) => {
-                            self.last_user_input = Instant::now();
-                            // Genuine keystrokes answering an OSC9-latched approval
-                            // (codex) clear it. Cursor's approval is screen-scraped
-                            // and authoritative-by-prompt: terminal chatter on stdin
-                            // (focus events, kitty-keyboard / cursor-position reports
-                            // — cursor enables `CSI > 1 u`) is NOT a user response and
-                            // must not force-clear it, or the status flickers off
-                            // "blocked: approval pending". The update_delivery_state
-                            // latch clears once the prompt actually leaves the screen.
-                            let cursor_scrape = self.config.target.name() == "cursor";
-                            if !cursor_scrape {
-                                self.screen.clear_approval();
-                            }
-                            // Update delivery state for user activity
-                            if let Ok(mut state) = self.delivery_state.write() {
-                                state.last_user_input = Instant::now();
+                            let focus_filtered = strip_focus_events(&buf[..n]);
+                            let user_input = focus_filtered.as_deref().unwrap_or(&buf[..n]);
+                            let has_user_input = !user_input.is_empty();
+
+                            if has_user_input {
+                                self.last_user_input = Instant::now();
+                                // Genuine keystrokes answering a title-detected approval
+                                // clear it immediately. Cursor's approval is screen-scraped
+                                // and authoritative-by-prompt, so it clears only when the
+                                // prompt actually leaves the screen.
+                                let cursor_scrape = self.config.target.name() == "cursor";
                                 if !cursor_scrape {
-                                    state.approval = false;
+                                    self.screen.clear_approval();
+                                }
+                                let mut approval_cleared = false;
+                                if let Ok(mut state) = self.delivery_state.write() {
+                                    state.last_user_input = Instant::now();
+                                    if !cursor_scrape {
+                                        approval_cleared = state.approval;
+                                        state.approval = false;
+                                    }
+                                }
+                                if approval_cleared {
+                                    self.publish_approval_status(false);
                                 }
                             }
                             // Copilot pauses stdin processing on terminal focus-out
@@ -1158,7 +1164,7 @@ impl Proxy {
                             // injection, that pause silently stalls delivery until the
                             // pane is refocused — so hide focus events from it.
                             if self.config.target.name() == "copilot"
-                                && let Some(filtered) = strip_focus_events(&buf[..n])
+                                && let Some(filtered) = focus_filtered
                             {
                                 write_all(&self.pty_master, &filtered)?;
                             } else {
@@ -1197,6 +1203,13 @@ impl Proxy {
                     match self.inject_server.read_client(i)? {
                         inject::InjectResult::Inject(text) => {
                             write_all(&self.pty_master, text.as_bytes())?;
+                            // Injected keystrokes reach the PTY master directly and
+                            // bypass the interactive stdin handler. When one answers a
+                            // pending approval, publish the cleared edge synchronously
+                            // here — while the row is still blocked — instead of leaving
+                            // it to the scrape falling edge, which races (and loses to)
+                            // lifecycle hooks and drops the `pty:approval_cleared` event.
+                            self.clear_injected_approval();
                         }
                         inject::InjectResult::Query(client) => match client.command {
                             inject::QueryCommand::Screen => {
@@ -1418,25 +1431,36 @@ impl Proxy {
 
     /// Update shared delivery state from screen tracker
     fn update_delivery_state(&self) {
+        let mut approval_changed = None;
         if let Ok(mut state) = self.delivery_state.write() {
             state.ready = self.screen.is_ready();
-            // Cursor's screen-scraped approval flickers false on partial-render
-            // frames mid-redraw. Latch it true and only clear once output settles,
-            // so a transient bad frame can't drop the signal and let the gate fall
-            // through to `prompt_has_text` ("uncommitted text"). Codex (OSC9) and
-            // antigravity keep their existing immediate signals below.
-            let cursor_approval =
-                self.config.target.name() == "cursor" && self.screen.is_cursor_approval_visible();
+            // Cursor and Codex can briefly erase their approval surfaces during
+            // redraws (Codex does this on focus changes). Latch positive detection
+            // until output settles so a partial frame cannot clear blocked status.
+            let scrape_latched_tool = matches!(
+                self.config.target.known_tool(),
+                Some(Tool::Codex | Tool::Cursor)
+            );
+            let scraped_approval = match self.config.target.known_tool() {
+                Some(Tool::Codex) => {
+                    self.screen.is_waiting_approval() || self.screen.is_codex_approval_visible()
+                }
+                Some(Tool::Cursor) => self.screen.is_cursor_approval_visible(),
+                _ => false,
+            };
             state.approval_scrape_latched = crate::delivery::latch_scraped_approval(
                 state.approval_scrape_latched,
-                cursor_approval,
+                scraped_approval,
                 self.screen
                     .is_output_stable(crate::delivery::APPROVAL_SCRAPE_CLEAR_MS),
             );
-            state.approval = self.screen.is_waiting_approval()
+            let approval = (scrape_latched_tool && state.approval_scrape_latched)
                 || (self.config.target.name() == "antigravity"
-                    && self.screen.is_antigravity_approval_visible())
-                || state.approval_scrape_latched;
+                    && self.screen.is_antigravity_approval_visible());
+            if approval != state.approval {
+                approval_changed = Some(approval);
+            }
+            state.approval = approval;
             let input_text = self.screen.get_input_box_text(self.config.target.name());
             let new_prompt_empty = input_text.as_ref().is_some_and(|t| t.is_empty());
             // Stamp submit-edge cooldown when input transitions from a known
@@ -1459,6 +1483,142 @@ impl Proxy {
             };
             state.last_output = self.screen.last_output_instant();
             state.cols = self.screen.cols();
+        }
+
+        if let Some(approval) = approval_changed {
+            self.publish_approval_status(approval);
+        }
+    }
+
+    /// Clear a pending approval answered by an injected keystroke.
+    ///
+    /// Only acts when approval is currently showing, so routine message
+    /// injection (approval already false) is a no-op and never falsely stamps
+    /// user-active state. Cursor's approval is authoritative-by-prompt — it
+    /// clears only when the prompt leaves the screen — so it is excluded here,
+    /// matching the interactive stdin handler.
+    fn clear_injected_approval(&mut self) {
+        if self.config.target.name() == "cursor" {
+            return;
+        }
+        let approval_cleared = match self.delivery_state.write() {
+            Ok(mut state) if state.approval => {
+                state.approval = false;
+                true
+            }
+            _ => false,
+        };
+        if approval_cleared {
+            self.screen.clear_approval();
+            self.publish_approval_status(false);
+        }
+    }
+
+    /// Publish PTY approval edges independently of the delivery queue.
+    ///
+    /// Approval is agent state: `hcom list` must report it even when no message
+    /// is pending. Clearing is guarded by the PTY-owned context so lifecycle
+    /// hooks that already moved the agent to active are never overwritten.
+    fn publish_approval_status(&self, approval: bool) {
+        let Ok(db) = HcomDb::open() else {
+            log_warn(
+                "native",
+                "pty.approval_status_open_failed",
+                "Failed to open database for PTY approval status",
+            );
+            return;
+        };
+
+        let config = Config::get();
+        let instance_name = config
+            .process_id
+            .as_deref()
+            .and_then(|process_id| db.get_process_binding(process_id).ok().flatten())
+            .or_else(|| self.config.instance_name.clone())
+            .or(config.instance_name);
+        let Some(instance_name) = instance_name.filter(|name| !name.is_empty()) else {
+            return;
+        };
+
+        let current = match db.get_instance_full(&instance_name) {
+            Ok(row) => row,
+            Err(error) => {
+                log_warn(
+                    "native",
+                    "pty.approval_status_failed",
+                    &format!(
+                        "Failed to read status for approval={} on {}: {}",
+                        approval, instance_name, error
+                    ),
+                );
+                return;
+            }
+        };
+        let already_blocked = current
+            .as_ref()
+            .is_some_and(|row| row.status == ST_BLOCKED && row.status_context == "pty:approval");
+
+        // Resolve the approval edge to publish: block on the rising edge, release
+        // on the falling edge, and stay silent when the row already matches.
+        let edge = if approval {
+            (!already_blocked).then_some((ST_BLOCKED, "pty:approval"))
+        } else {
+            already_blocked.then_some((ST_LISTENING, "pty:approval_cleared"))
+        };
+        let Some((status, context)) = edge else {
+            // No transition to publish. Still reflect a standing block in the
+            // PTY-owned shared status so `hcom list` stays consistent.
+            if already_blocked && let Ok(mut shared_status) = self.current_status.write() {
+                *shared_status = ST_BLOCKED.to_string();
+            }
+            return;
+        };
+
+        // Write the instance row, then log a paired status event. The bare
+        // `set_status` leaves `status_detail` (the gated-command preview) intact,
+        // while the explicit event keeps the block/release visible to the events
+        // table, `events sub`, and the TUI — mirroring how the sibling
+        // launch_blocked path pairs a row write with its own emitted event.
+        // Without the event, the row updates silently and event consumers never
+        // see the approval gate (Codex's only PTY-driven block path).
+        if let Err(error) = db.set_status(&instance_name, status, context) {
+            log_warn(
+                "native",
+                "pty.approval_status_failed",
+                &format!(
+                    "Failed to publish approval={} for {}: {}",
+                    approval, instance_name, error
+                ),
+            );
+            return;
+        }
+
+        let position = current.as_ref().map(|row| row.last_event_id).unwrap_or(0);
+        let detail = current
+            .as_ref()
+            .map(|row| row.status_detail.as_str())
+            .unwrap_or("");
+        let mut data = serde_json::json!({
+            "status": status,
+            "context": context,
+            "position": position,
+        });
+        if !detail.is_empty() {
+            data["detail"] = serde_json::json!(detail);
+        }
+        if let Err(error) = db.log_event("status", &instance_name, &data) {
+            log_warn(
+                "native",
+                "pty.approval_status_event_failed",
+                &format!(
+                    "Failed to emit approval status event ({}) for {}: {}",
+                    context, instance_name, error
+                ),
+            );
+        }
+
+        if let Ok(mut shared_status) = self.current_status.write() {
+            *shared_status = status.to_string();
         }
     }
 

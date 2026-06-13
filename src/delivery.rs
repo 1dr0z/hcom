@@ -623,14 +623,11 @@ pub struct ScreenState {
     /// race window where the gate sees
     /// `listening` + `prompt_empty`). See `SUBMIT_SETTLE_COOLDOWN_MS`.
     pub last_prompt_submit: Option<Instant>,
-    /// Latched cursor screen-scraped approval signal. Screen scraping reads a
-    /// partial frame mid-redraw as "no approval", which would flicker `approval`
-    /// false while the prompt is still up and let the gate fall through to
-    /// `prompt_has_text` (wrong "uncommitted text" status). Latch true on any
-    /// positive scrape and only clear once output has settled, so a transient
-    /// partial render can't drop the signal. Codex's OSC9 approval is event-based
-    /// (already stable) and antigravity keeps its immediate scrape; both bypass
-    /// this latch. See `APPROVAL_SCRAPE_CLEAR_MS`.
+    /// Latched Cursor/Codex approval signal. Their TUI redraws can briefly erase
+    /// both the dialog and title, which would flicker `approval` false while the
+    /// prompt is still up. Latch true on any positive detection and only clear
+    /// once output has settled. Antigravity keeps its immediate scrape.
+    /// See `APPROVAL_SCRAPE_CLEAR_MS`.
     pub approval_scrape_latched: bool,
 }
 
@@ -1336,27 +1333,6 @@ pub fn run_delivery_loop(
                         log_warn("native", "delivery.register_inject_fail", &format!("{}", e));
                     }
 
-                    // Clear stale PTY-owned approval state even when no messages are pending.
-                    if let Ok(Some((status, context))) = db.get_status(&current_name)
-                        && status == ST_BLOCKED
-                        && context == "pty:approval"
-                    {
-                        let approval_showing = {
-                            let screen = state.screen.read().unwrap();
-                            screen.approval
-                        };
-                        if !approval_showing
-                            && let Err(e) =
-                                db.set_status(&current_name, ST_LISTENING, "pty:approval_cleared")
-                        {
-                            log_warn(
-                                "native",
-                                "delivery.set_status_fail",
-                                &format!("Failed to clear PTY approval status: {}", e),
-                            );
-                        }
-                    }
-
                     // Check for pending messages
                     let has_pending = db.has_pending(&current_name);
                     if has_pending {
@@ -1488,25 +1464,11 @@ pub fn run_delivery_loop(
                             block_since = Some(Instant::now());
                         }
 
-                        // Update status based on PTY-detected approval
-                        // Check screen.approval directly, not gate.reason (gate may return
-                        // "not_idle" even when approval is showing due to check order)
                         let approval_showing = {
                             let screen = state.screen.read().unwrap();
                             screen.approval
                         };
-                        if approval_showing {
-                            // Approval detected via PTY (currently Codex OSC9).
-                            // Only PTY-owned blocked state should be cleared from this path.
-                            if let Err(e) = db.set_status(&current_name, "blocked", "pty:approval")
-                            {
-                                log_warn(
-                                    "native",
-                                    "delivery.set_status_fail",
-                                    &format!("Failed to set blocked status: {}", e),
-                                );
-                            }
-                        } else if gate.reason == "not_idle" {
+                        if !approval_showing && gate.reason == "not_idle" {
                             // Stability-based recovery: if status stuck "active" but output stable 10s,
                             // or stale PTY approval was left behind after the PTY cleared,
                             // flip back to listening.
@@ -1541,23 +1503,6 @@ pub fn run_delivery_loop(
                                         attempt = 0;
                                         continue;
                                     }
-                                }
-                                Ok(Some((status, context)))
-                                    if status == ST_BLOCKED && context == "pty:approval" =>
-                                {
-                                    if let Err(e) = db.set_status(
-                                        &current_name,
-                                        ST_LISTENING,
-                                        "pty:approval_cleared",
-                                    ) {
-                                        log_warn(
-                                            "native",
-                                            "delivery.set_status_fail",
-                                            &format!("Failed to clear PTY approval status: {}", e),
-                                        );
-                                    }
-                                    attempt = 0;
-                                    continue;
                                 }
                                 Ok(Some(_)) | Ok(None) => {
                                     // Status not "active" or not found - skip recovery

@@ -2,7 +2,7 @@
 //!
 //! Provides gate conditions for safe injection:
 //! - is_ready(): Ready pattern visible on screen
-//! - is_waiting_approval(): OSC9 approval notification detected
+//! - is_waiting_approval(): OSC terminal title reports action required
 //! - is_output_stable(ms): Screen unchanged for N milliseconds
 //! - is_prompt_empty(tool): Input box has no user text
 //! - get_input_box_text(tool): Extract text from input box
@@ -33,27 +33,52 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-/// OSC9 approval notification patterns.
-///
-/// Codex emits these escape sequences when user approval is needed:
-/// - `OSC9_APPROVAL`: "Approval requested" - for exec or MCP elicitation
-/// - `OSC9_EDIT`: "Codex wants to edit" - for file edits
-///
-/// We detect these in the raw output buffer (before vt100 parsing strips them)
-/// to set DB status to "blocked" for TUI visibility. Injection is already gated
-/// by hook-set status, but OSC9 detection provides immediate status feedback.
-const OSC9_APPROVAL: &[u8] = b"\x1b]9;Approval requested";
-const OSC9_EDIT: &[u8] = b"\x1b]9;Codex wants to edit";
+const OSC_TITLE_0: &[u8] = b"\x1b]0;";
+const OSC_TITLE_2: &[u8] = b"\x1b]2;";
+const CODEX_ACTION_REQUIRED: &str = "Action Required";
 
-/// Check if haystack contains needle (simple O(n) search)
-fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    if needle.is_empty() {
-        return true;
+/// Return the last complete OSC 0/2 terminal title in a raw output buffer.
+///
+/// OSC strings may end with BEL or ST and may be split across PTY reads. Calling
+/// this on the rolling output buffer handles both cases without matching ordinary
+/// terminal body text.
+fn last_osc_title(buffer: &[u8]) -> Option<String> {
+    let mut offset = 0;
+    let mut last_title = None;
+
+    while offset < buffer.len() {
+        let remaining = &buffer[offset..];
+        let start_0 = remaining
+            .windows(OSC_TITLE_0.len())
+            .position(|w| w == OSC_TITLE_0);
+        let start_2 = remaining
+            .windows(OSC_TITLE_2.len())
+            .position(|w| w == OSC_TITLE_2);
+        let (start, prefix_len) = match (start_0, start_2) {
+            (Some(a), Some(b)) if a <= b => (a, OSC_TITLE_0.len()),
+            (Some(_), Some(b)) => (b, OSC_TITLE_2.len()),
+            (Some(a), None) => (a, OSC_TITLE_0.len()),
+            (None, Some(b)) => (b, OSC_TITLE_2.len()),
+            (None, None) => break,
+        };
+
+        let content_start = offset + start + prefix_len;
+        let content = &buffer[content_start..];
+        let bel_end = content.iter().position(|&b| b == b'\x07');
+        let st_end = content.windows(2).position(|w| w == b"\x1b\\");
+        let (end, terminator_len) = match (bel_end, st_end) {
+            (Some(a), Some(b)) if a <= b => (a, 1),
+            (Some(_), Some(b)) => (b, 2),
+            (Some(a), None) => (a, 1),
+            (None, Some(b)) => (b, 2),
+            (None, None) => break,
+        };
+
+        last_title = Some(String::from_utf8_lossy(&content[..end]).into_owned());
+        offset = content_start + end + terminator_len;
     }
-    if haystack.len() < needle.len() {
-        return false;
-    }
-    haystack.windows(needle.len()).any(|w| w == needle)
+
+    last_title
 }
 
 /// Trim whitespace including NBSP (U+00A0) from both ends
@@ -176,11 +201,10 @@ impl ScreenTracker {
             self.output_buffer.drain(..excess);
         }
 
-        // Check for OSC9 approval notifications in new data only (one-way latch)
-        if !self.waiting_approval
-            && (contains_bytes(data, OSC9_APPROVAL) || contains_bytes(data, OSC9_EDIT))
-        {
-            self.waiting_approval = true;
+        // Codex emits an ungated OSC terminal title on every state refresh. Treat
+        // approval as a level so a later Working/idle title clears it promptly.
+        if let Some(title) = last_osc_title(&self.output_buffer) {
+            self.waiting_approval = title.contains(CODEX_ACTION_REQUIRED);
         }
 
         // Feed to vt100 parser
@@ -202,9 +226,8 @@ impl ScreenTracker {
         self.parser.screen_mut().set_size(rows, cols);
     }
 
-    /// Clear approval state (user typed something).
-    /// Also clears output_buffer to prevent stale OSC9 patterns from
-    /// re-triggering approval on the next process() call.
+    /// Clear approval state immediately when the user responds.
+    /// The next complete title refresh remains authoritative.
     pub fn clear_approval(&mut self) {
         self.waiting_approval = false;
         self.output_buffer.clear();
@@ -235,9 +258,39 @@ impl ScreenTracker {
         false
     }
 
-    /// Check if waiting for approval (OSC9 detected)
+    /// Check if the latest complete OSC terminal title requires action.
     pub fn is_waiting_approval(&self) -> bool {
         self.waiting_approval
+    }
+
+    /// Codex approval fallback for blocker dialogs visible on screen.
+    ///
+    /// Terminal-title detection is primary. This catches dialog variants that
+    /// render before or without the title update while excluding the transcript
+    /// viewer, which is navigable but not an approval blocker.
+    pub fn is_codex_approval_visible(&self) -> bool {
+        let lines = self.get_screen_lines();
+        let start = lines
+            .iter()
+            .rposition(|line| line.trim_start().starts_with('›'))
+            .unwrap_or(0);
+        let visible = lines[start..].join("\n").to_lowercase();
+
+        if visible.contains("↑/↓ to scroll")
+            && visible.contains("q to quit")
+            && visible.contains("esc to edit prev")
+        {
+            return false;
+        }
+
+        visible.contains("allow command?")
+            || visible.contains("press enter to confirm or esc to cancel")
+            || visible.contains("enter to submit answer")
+            || visible.contains("enter to submit all")
+            || visible.contains("[y/n]")
+            || visible.contains("yes (y)")
+            || (visible.contains("do you want to")
+                && (visible.contains("yes") || visible.contains('❯')))
     }
 
     /// Antigravity-specific approval detection: the agy TUI renders permission
@@ -973,30 +1026,69 @@ mod tests {
         assert!(t.is_ready());
     }
 
-    // ---- OSC9 approval detection ----
+    // ---- Codex approval detection ----
 
     #[test]
-    fn detects_osc9_approval() {
+    fn detects_action_required_title() {
         let mut t = make_tracker(24, 80, "");
         assert!(!t.is_waiting_approval());
-        t.process(b"\x1b]9;Approval requested\x07");
+        t.process(b"\x1b]0;[ ! ] Action Required | proj | Working\x07");
         assert!(t.is_waiting_approval());
     }
 
     #[test]
-    fn detects_osc9_codex_edit() {
+    fn detects_hidden_action_required_title() {
         let mut t = make_tracker(24, 80, "");
-        t.process(b"\x1b]9;Codex wants to edit\x07");
+        t.process(b"\x1b]2;[ . ] Action Required | proj | Working\x1b\\");
         assert!(t.is_waiting_approval());
     }
 
     #[test]
-    fn clear_approval_resets() {
+    fn title_refresh_clears_approval() {
         let mut t = make_tracker(24, 80, "");
-        t.process(b"\x1b]9;Approval requested\x07");
+        t.process(b"\x1b]0;[ ! ] Action Required | proj | Working\x07");
+        assert!(t.is_waiting_approval());
+        t.process(b"\x1b]0;proj | Working\x07");
+        assert!(!t.is_waiting_approval());
+    }
+
+    #[test]
+    fn detects_title_split_across_process_calls() {
+        let mut t = make_tracker(24, 80, "");
+        t.process(b"\x1b]0;[ ! ] Action");
+        assert!(!t.is_waiting_approval());
+        t.process(b" Required | proj | Working\x07");
+        assert!(t.is_waiting_approval());
+    }
+
+    #[test]
+    fn action_required_body_text_does_not_trigger() {
+        let mut t = make_tracker(24, 80, "");
+        t.process(b"Action Required is ordinary agent output\r\n");
+        assert!(!t.is_waiting_approval());
+    }
+
+    #[test]
+    fn clear_approval_resets_title_state() {
+        let mut t = make_tracker(24, 80, "");
+        t.process(b"\x1b]0;[ ! ] Action Required | proj | Working\x07");
         assert!(t.is_waiting_approval());
         t.clear_approval();
         assert!(!t.is_waiting_approval());
+    }
+
+    #[test]
+    fn codex_detects_visible_approval_dialog() {
+        let mut t = make_tracker(24, 80, "");
+        t.process(b"Run command\r\nAllow command?\r\nPress enter to confirm or esc to cancel\r\n");
+        assert!(t.is_codex_approval_visible());
+    }
+
+    #[test]
+    fn codex_transcript_viewer_is_not_approval() {
+        let mut t = make_tracker(24, 80, "");
+        t.process("Transcript\r\n↑/↓ to scroll  q to quit  esc to edit prev\r\n".as_bytes());
+        assert!(!t.is_codex_approval_visible());
     }
 
     // ---- Antigravity approval detection ----
@@ -1464,16 +1556,6 @@ mod tests {
         );
         // Real prompt is empty — parser should find this, not the stale one
         assert_eq!(t.get_claude_input_text(), Some(String::new()));
-    }
-
-    // ---- contains_bytes ----
-
-    #[test]
-    fn contains_bytes_basic() {
-        assert!(contains_bytes(b"hello world", b"world"));
-        assert!(!contains_bytes(b"hello", b"world"));
-        assert!(contains_bytes(b"abc", b""));
-        assert!(!contains_bytes(b"", b"abc"));
     }
 
     // ---- trim_with_nbsp ----
