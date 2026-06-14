@@ -14,7 +14,7 @@
 //!   registry — already a single source of truth, no drift across tools).
 //! - Tool environment detection (owned by `shared::tool_detection`, including
 //!   precedence and child-env clearing).
-//! - Transcript parser dispatch (already abstracted by `transcript::ToolKind`).
+//! - Transcript parser implementations (owned by `transcript::TranscriptBackend`; canonical identity stays `Tool`).
 //! - System-prompt env var keys (typed fields on `HcomConfig`; lookup goes
 //!   through `config.rs::FIELD_TO_ENV`).
 
@@ -102,6 +102,14 @@ pub enum InitialPromptShape {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct PtySpec {
+    /// Maximum time to wait for the tool-specific ready pattern before
+    /// starting delivery anyway. Every known integration declares this
+    /// explicitly; ad-hoc commands use the Adhoc profile.
+    pub delivery_start_timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct LaunchSpec {
     /// Env var holding default CLI args (e.g. `HCOM_CLAUDE_ARGS`).
     pub args_env: Option<&'static str>,
@@ -176,6 +184,7 @@ pub struct IntegrationSpec {
     pub released: bool,
     /// PTY ready-pattern bytes (empty for Adhoc).
     pub ready_pattern: &'static [u8],
+    pub pty: PtySpec,
     /// Environment variables specific to this tool's instance state that
     /// will corrupt a same-tool child if leaked (session IDs, sandbox modes,
     /// config-directory pointers, process-role assignments, per-instance
@@ -388,6 +397,9 @@ pub static CLAUDE: IntegrationSpec = IntegrationSpec {
     adhoc_icon: None,
     released: true,
     ready_pattern: b"? for shortcuts",
+    pty: PtySpec {
+        delivery_start_timeout_secs: 5,
+    },
     instance_state_env: &[],
     hooks: HooksSpec {
         names: CLAUDE_HOOKS,
@@ -438,6 +450,9 @@ pub static GEMINI: IntegrationSpec = IntegrationSpec {
     adhoc_icon: None,
     released: true,
     ready_pattern: b"Type your message",
+    pty: PtySpec {
+        delivery_start_timeout_secs: 60,
+    },
     instance_state_env: &["GEMINI_PTY_INFO"],
     hooks: HooksSpec {
         names: GEMINI_HOOKS,
@@ -487,6 +502,9 @@ pub static CODEX: IntegrationSpec = IntegrationSpec {
     adhoc_icon: None,
     released: true,
     ready_pattern: "\u{203A} ".as_bytes(),
+    pty: PtySpec {
+        delivery_start_timeout_secs: 5,
+    },
     instance_state_env: &["CODEX_EXEC_SERVER_URL"],
     hooks: HooksSpec {
         names: CODEX_HOOKS,
@@ -536,6 +554,9 @@ pub static OPENCODE: IntegrationSpec = IntegrationSpec {
     adhoc_icon: None,
     released: true,
     ready_pattern: b"ctrl+p commands",
+    pty: PtySpec {
+        delivery_start_timeout_secs: 5,
+    },
     instance_state_env: &["OPENCODE_RUN_ID", "OPENCODE_PROCESS_ROLE"],
     hooks: HooksSpec {
         names: OPENCODE_HOOKS,
@@ -596,6 +617,9 @@ pub static KILO: IntegrationSpec = IntegrationSpec {
     // rather than regenerated → a leaked parent value collides a same-tool
     // child, exactly like OpenCode's OPENCODE_RUN_ID/OPENCODE_PROCESS_ROLE).
     // KILO_DB is the on-disk session store; all three are instance-state.
+    pty: PtySpec {
+        delivery_start_timeout_secs: 5,
+    },
     instance_state_env: &["KILO_DB", "KILO_RUN_ID", "KILO_PROCESS_ROLE"],
     hooks: HooksSpec {
         names: OPENCODE_HOOKS,
@@ -645,6 +669,9 @@ pub static ANTIGRAVITY: IntegrationSpec = IntegrationSpec {
     adhoc_icon: None,
     released: true,
     ready_pattern: b"? for shortcuts",
+    pty: PtySpec {
+        delivery_start_timeout_secs: 5,
+    },
     instance_state_env: &["ANTIGRAVITY_EXECUTABLE_DATA_DIR", "GEMINI_PTY_INFO"],
     hooks: HooksSpec {
         names: GEMINI_HOOKS,
@@ -704,6 +731,9 @@ pub static CURSOR: IntegrationSpec = IntegrationSpec {
     // Prompt-empty detection is the readiness signal for the MVP.
     ready_pattern: b"",
     // Closed-source; unknown instance-state vars are a documented gap.
+    pty: PtySpec {
+        delivery_start_timeout_secs: 5,
+    },
     instance_state_env: &[],
     hooks: HooksSpec {
         names: CURSOR_HOOKS,
@@ -759,6 +789,9 @@ pub static KIMI: IntegrationSpec = IntegrationSpec {
     adhoc_icon: None,
     released: true,
     ready_pattern: b"> ",
+    pty: PtySpec {
+        delivery_start_timeout_secs: 5,
+    },
     instance_state_env: &[],
     hooks: HooksSpec {
         names: KIMI_HOOKS,
@@ -820,6 +853,9 @@ pub static PI: IntegrationSpec = IntegrationSpec {
     adhoc_icon: None,
     released: true,
     ready_pattern: b"/ commands",
+    pty: PtySpec {
+        delivery_start_timeout_secs: 5,
+    },
     instance_state_env: &[],
     hooks: HooksSpec {
         names: PI_HOOKS,
@@ -879,6 +915,9 @@ pub static COPILOT: IntegrationSpec = IntegrationSpec {
     // inject during the loading window.
     ready_pattern: b"/ commands",
     // Closed-source; unknown instance-state vars are a documented gap.
+    pty: PtySpec {
+        delivery_start_timeout_secs: 60,
+    },
     instance_state_env: &[],
     hooks: HooksSpec {
         names: COPILOT_HOOKS,
@@ -926,6 +965,9 @@ pub static ADHOC: IntegrationSpec = IntegrationSpec {
     adhoc_icon: Some("\u{25e6}"), // ◦ neutral dot
     released: false,
     ready_pattern: b"",
+    pty: PtySpec {
+        delivery_start_timeout_secs: 60,
+    },
     instance_state_env: &[],
     hooks: HooksSpec {
         names: &[],
@@ -1111,6 +1153,20 @@ mod tests {
     #[test]
     fn released_background_matches_prior_constant() {
         assert_eq!(released_background_tool_names(), vec!["claude"]);
+    }
+
+    #[test]
+    fn every_tool_declares_a_nonzero_pty_delivery_timeout() {
+        for spec in ALL {
+            assert!(
+                spec.pty.delivery_start_timeout_secs > 0,
+                "{} must declare a PTY delivery timeout",
+                spec.name
+            );
+        }
+        assert_eq!(GEMINI.pty.delivery_start_timeout_secs, 60);
+        assert_eq!(COPILOT.pty.delivery_start_timeout_secs, 60);
+        assert_eq!(CLAUDE.pty.delivery_start_timeout_secs, 5);
     }
 
     #[test]

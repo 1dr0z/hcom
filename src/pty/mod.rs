@@ -71,6 +71,10 @@ impl PtyTarget {
             Self::AdhocCommand(_) => Tool::Adhoc,
         }
     }
+
+    fn delivery_start_timeout(&self) -> Duration {
+        Duration::from_secs(self.delivery_tool().spec().pty.delivery_start_timeout_secs)
+    }
 }
 
 /// Tracks what type of incomplete escape sequence is pending on stdout.
@@ -845,19 +849,10 @@ impl Proxy {
         // iteration after, so at most one poll cycle of latency for new connections.
         let mut listener_backoff = false;
 
-        // For Claude in accept-edits mode, ready pattern may be hidden.
-        // Start delivery after timeout if ready pattern not seen.
-        let delivery_start_timeout = match self.config.target.known_tool() {
-            Some(Tool::Claude)
-            | Some(Tool::Codex)
-            | Some(Tool::Antigravity)
-            | Some(Tool::Cursor)
-            | Some(Tool::Kimi) => {
-                Duration::from_secs(5) // ? for shortcuts footer (Claude/Codex/agy)
-            }
-            Some(Tool::OpenCode) | Some(Tool::Kilo) | Some(Tool::Pi) => Duration::from_secs(5),
-            _ => Duration::from_secs(60), // Gemini: ready pattern always visible
-        };
+        // Start delivery after the integration's explicit fallback timeout if
+        // its ready pattern is hidden or never appears. Ad-hoc commands use the
+        // explicit Adhoc PTY profile rather than inheriting a known tool's value.
+        let delivery_start_timeout = self.config.target.delivery_start_timeout();
 
         loop {
             // Handle signals
