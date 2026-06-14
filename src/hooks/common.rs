@@ -154,20 +154,6 @@ pub(crate) fn make_tip_checker(db: &HcomDb) -> impl Fn(&str, &str) -> (bool, Box
     }
 }
 
-pub(crate) struct DeliveryBatch {
-    messages: Vec<Value>,
-}
-
-impl DeliveryBatch {
-    pub(crate) fn format_model_context(&self, db: &HcomDb, instance_name: &str) -> String {
-        format_messages_json_for_instance(db, &self.messages, instance_name)
-    }
-
-    pub(crate) fn format_user_display(&self, db: &HcomDb, instance_name: &str) -> String {
-        format_hook_messages_for_instance(db, &self.messages, instance_name)
-    }
-}
-
 /// Prepared delivery — messages formatted but cursor not yet advanced.
 ///
 /// Used by tools that need to ensure stdout write succeeds before committing.
@@ -290,52 +276,6 @@ pub(crate) fn format_hook_messages_for_instance(
     )
 }
 
-pub(crate) fn prepare_delivery_batch(
-    db: &HcomDb,
-    instance_name: &str,
-    raw_messages: Vec<Message>,
-) -> Option<DeliveryBatch> {
-    if raw_messages.is_empty() {
-        return None;
-    }
-
-    let messages: Vec<Value> = raw_messages.iter().map(message_to_value).collect();
-    let deliver = limit_delivery_messages(&messages);
-
-    let last_id = deliver
-        .last()
-        .and_then(|m| m.get("event_id").and_then(|v| v.as_i64()))
-        .unwrap_or(0);
-
-    let mut updates = serde_json::Map::new();
-    updates.insert("last_event_id".into(), serde_json::json!(last_id));
-    instances::update_instance_position(db, instance_name, &updates);
-
-    let sender = deliver
-        .first()
-        .and_then(|m| m.get("from").and_then(|v| v.as_str()))
-        .unwrap_or("unknown");
-    let sender_display = identity::get_display_name(db, sender);
-    let msg_ts = deliver
-        .last()
-        .and_then(|m| m.get("timestamp").and_then(|v| v.as_str()))
-        .unwrap_or("")
-        .to_string();
-
-    lifecycle::set_status(
-        db,
-        instance_name,
-        ST_ACTIVE,
-        &format!("deliver:{}", sender_display),
-        lifecycle::StatusUpdate {
-            msg_ts: &msg_ts,
-            ..Default::default()
-        },
-    );
-
-    Some(DeliveryBatch { messages: deliver })
-}
-
 /// Prepare pending messages for delivery without committing cursor advance.
 ///
 /// Returns formatted text + ack token. Caller must call `commit_delivery_ack`
@@ -365,8 +305,7 @@ pub fn commit_delivery_ack(db: &HcomDb, ack: &super::DeliveryAck) {
 
 /// Prepare raw messages into a PreparedDelivery without committing cursor/status.
 ///
-/// Unlike `prepare_delivery_batch` (which commits immediately for Claude),
-/// this defers cursor advance and status update to `commit_delivery_ack`.
+/// Cursor advance and status update are deferred to `commit_delivery_ack`.
 fn prepare_raw_messages(
     db: &HcomDb,
     instance_name: &str,
@@ -1567,57 +1506,6 @@ mod tests {
                 rusqlite::params![timestamp, instance, data],
             )
             .unwrap();
-    }
-
-    #[test]
-    fn test_prepare_delivery_batch_empty() {
-        let (_dir, db) = make_test_db();
-        insert_test_instance(&db, "nova");
-
-        let batch = prepare_delivery_batch(&db, "nova", vec![]);
-        assert!(batch.is_none());
-    }
-
-    #[test]
-    fn test_prepare_delivery_batch_caps_cursor_and_status() {
-        let (_dir, db) = make_test_db();
-        insert_test_instance(&db, "nova");
-        for i in 0..(MAX_MESSAGES_PER_DELIVERY + 2) {
-            insert_test_message(
-                &db,
-                "luna",
-                "luna",
-                &format!("msg {i}"),
-                &format!("2026-01-01T00:00:{i:02}Z"),
-            );
-        }
-
-        let raw_messages = db.get_unread_messages("nova");
-        let batch = prepare_delivery_batch(&db, "nova", raw_messages).unwrap();
-
-        assert_eq!(batch.messages.len(), MAX_MESSAGES_PER_DELIVERY);
-
-        let cursor: i64 = db
-            .conn()
-            .query_row(
-                "SELECT last_event_id FROM instances WHERE name = 'nova'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let expected_last_id = batch
-            .messages
-            .last()
-            .and_then(|m| m.get("event_id"))
-            .and_then(|v| v.as_i64())
-            .unwrap();
-        assert_eq!(cursor, expected_last_id);
-
-        let instance = db.get_instance_full("nova").unwrap().unwrap();
-        let delivered_name = crate::identity::get_display_name(&db, "luna");
-
-        assert_eq!(instance.status, ST_ACTIVE);
-        assert_eq!(instance.status_context, format!("deliver:{delivered_name}"));
     }
 
     #[test]

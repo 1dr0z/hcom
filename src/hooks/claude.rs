@@ -14,9 +14,9 @@ use std::sync::LazyLock;
 use crate::bootstrap;
 use crate::config::HcomConfig;
 use crate::db::{HcomDb, InstanceRow};
-use crate::hooks::HookPayload;
 use crate::hooks::common;
 use crate::hooks::family;
+use crate::hooks::{DeliveryAck, HookPayload};
 use crate::instance_binding;
 use crate::instance_lifecycle as lifecycle;
 use crate::instance_names;
@@ -94,16 +94,23 @@ pub fn dispatch_claude_hook(hook_type: &str) -> i32 {
     // Build payload
     let mut payload = HookPayload::from_claude(raw);
 
-    let (exit_code, stdout, timing) = common::dispatch_with_panic_guard(
+    let (exit_code, stdout, delivery_ack, timing) = common::dispatch_with_panic_guard(
         "claude",
         hook_type,
-        (0, String::new(), DispatchTiming::default()),
+        (0, String::new(), None, DispatchTiming::default()),
         || route_claude_hook(&db, &ctx, hook_type, &mut payload),
     );
 
     // Output result
     if !stdout.is_empty() {
-        print!("{}", stdout);
+        let mut writer = std::io::stdout().lock();
+        if let Err(e) = write_hook_output(&db, &mut writer, &stdout, delivery_ack.as_ref()) {
+            log::log_error(
+                "hooks",
+                "claude.stdout_error",
+                &format!("hook={} err={}", hook_type, e),
+            );
+        }
     }
 
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -115,6 +122,20 @@ pub fn dispatch_claude_hook(hook_type: &str) -> i32 {
     );
 
     exit_code
+}
+
+fn write_hook_output(
+    db: &HcomDb,
+    writer: &mut impl std::io::Write,
+    stdout: &str,
+    delivery_ack: Option<&DeliveryAck>,
+) -> std::io::Result<()> {
+    writer.write_all(stdout.as_bytes())?;
+    writer.flush()?;
+    if let Some(ack) = delivery_ack {
+        common::commit_delivery_ack(db, ack);
+    }
+    Ok(())
 }
 
 /// Per-stage timing collected during dispatch,
@@ -178,19 +199,19 @@ impl DispatchTiming {
 
 /// Core dispatcher — routes to appropriate handler.
 ///
-/// Returns (exit_code, stdout_string, timing).
+/// Returns (exit_code, stdout_string, deferred delivery ack, timing).
 fn route_claude_hook(
     db: &HcomDb,
     ctx: &HcomContext,
     hook_type: &str,
     payload: &mut HookPayload,
-) -> (i32, String, DispatchTiming) {
+) -> (i32, String, Option<DeliveryAck>, DispatchTiming) {
     let dispatch_start = Instant::now();
     let mut timing = DispatchTiming::default();
 
     // Ensure directories and init DB
     if !paths::ensure_hcom_directories() {
-        return (0, String::new(), timing);
+        return (0, String::new(), None, timing);
     }
 
     timing.init_ms = Some(dispatch_start.elapsed().as_secs_f64() * 1000.0);
@@ -211,7 +232,7 @@ fn route_claude_hook(
         let handler_start = Instant::now();
         let result = handle_sessionstart(db, ctx, &session_id, &payload.raw);
         timing.handler_ms = Some(handler_start.elapsed().as_secs_f64() * 1000.0);
-        return (result.0, result.1, timing);
+        return (result.0, result.1, None, timing);
     }
 
     // Task transitions
@@ -223,13 +244,13 @@ fn route_claude_hook(
         let task_start = Instant::now();
         let (stdout, exit_code) = start_task(db, &session_id, &payload.raw);
         timing.task_ms = Some(task_start.elapsed().as_secs_f64() * 1000.0);
-        return (exit_code, stdout, timing);
+        return (exit_code, stdout, None, timing);
     }
     if hook_type == HOOK_POST && is_task_tool {
         let task_start = Instant::now();
         let stdout = end_task(db, &session_id, &payload.raw, false).unwrap_or_default();
         timing.task_ms = Some(task_start.elapsed().as_secs_f64() * 1000.0);
-        return (0, stdout, timing);
+        return (0, stdout, None, timing);
     }
 
     // Subagent context check
@@ -268,18 +289,23 @@ fn route_claude_hook(
             }
             let output = subagent_start(&payload.raw);
             if let Some(out) = output {
-                return (0, serde_json::to_string(&out).unwrap_or_default(), timing);
+                return (
+                    0,
+                    serde_json::to_string(&out).unwrap_or_default(),
+                    None,
+                    timing,
+                );
             }
-            return (0, String::new(), timing);
+            return (0, String::new(), None, timing);
         }
 
         if hook_type == HOOK_SUBAGENT_STOP {
             let (exit_code, stdout) = subagent_stop(db, &payload.raw, &session_id);
-            return (exit_code, stdout, timing);
+            return (exit_code, stdout, None, timing);
         }
 
         if hook_type == HOOK_NOTIFY {
-            return (0, String::new(), timing);
+            return (0, String::new(), None, timing);
         }
 
         if hook_type == HOOK_PRE || hook_type == HOOK_POST {
@@ -290,11 +316,11 @@ fn route_claude_hook(
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 if hook_type == HOOK_POST && extract_name(command).is_some() {
-                    let (exit_code, stdout) = subagent_posttooluse(db, &payload.raw);
-                    return (exit_code, stdout, timing);
+                    let (exit_code, stdout, delivery_ack) = subagent_posttooluse(db, &payload.raw);
+                    return (exit_code, stdout, delivery_ack, timing);
                 }
             }
-            return (0, String::new(), timing);
+            return (0, String::new(), None, timing);
         }
     }
 
@@ -333,35 +359,50 @@ fn route_claude_hook(
 
     let Some(ref instance_name) = instance_name else {
         timing.result = Some("no_instance");
-        return (0, String::new(), timing);
+        return (0, String::new(), None, timing);
     };
 
     let instance_data = match db.get_instance_full(instance_name) {
         Ok(Some(data)) => data,
         _ => {
             timing.result = Some("no_instance_data");
-            return (0, String::new(), timing);
+            return (0, String::new(), None, timing);
         }
     };
 
     // Dispatch to handler
     timing.instance = Some(instance_name.clone());
     let handler_start = Instant::now();
-    let result = match hook_type {
-        HOOK_PRE => handle_pretooluse(db, payload, instance_name),
+    let (exit_code, stdout, delivery_ack) = match hook_type {
+        HOOK_PRE => {
+            let (code, stdout) = handle_pretooluse(db, payload, instance_name);
+            (code, stdout, None)
+        }
         HOOK_POST => handle_posttooluse(db, ctx, payload, instance_name, &instance_data, &updates),
-        HOOK_POLL => handle_poll(db, ctx, instance_name, &instance_data),
-        HOOK_NOTIFY => handle_notify(db, payload, instance_name, &updates),
-        HOOK_PERMISSION_REQUEST => handle_permission_request(db, payload, instance_name, &updates),
+        HOOK_POLL => {
+            let (code, stdout) = handle_poll(db, ctx, instance_name, &instance_data);
+            (code, stdout, None)
+        }
+        HOOK_NOTIFY => {
+            let (code, stdout) = handle_notify(db, payload, instance_name, &updates);
+            (code, stdout, None)
+        }
+        HOOK_PERMISSION_REQUEST => {
+            let (code, stdout) = handle_permission_request(db, payload, instance_name, &updates);
+            (code, stdout, None)
+        }
         HOOK_USERPROMPTSUBMIT => {
             handle_userpromptsubmit(db, ctx, payload, instance_name, &updates, &instance_data)
         }
-        HOOK_SESSIONEND => handle_sessionend(db, instance_name, &payload.raw, &updates),
-        _ => (0, String::new()),
+        HOOK_SESSIONEND => {
+            let (code, stdout) = handle_sessionend(db, instance_name, &payload.raw, &updates);
+            (code, stdout, None)
+        }
+        _ => (0, String::new(), None),
     };
     timing.handler_ms = Some(handler_start.elapsed().as_secs_f64() * 1000.0);
 
-    (result.0, result.1, timing)
+    (exit_code, stdout, delivery_ack, timing)
 }
 
 /// Get correct session_id, handling Claude Code's fork bug.
@@ -920,9 +961,10 @@ fn handle_posttooluse(
     instance_name: &str,
     instance_data: &InstanceRow,
     updates: &serde_json::Map<String, Value>,
-) -> (i32, String) {
+) -> (i32, String, Option<DeliveryAck>) {
     let tool_name = payload.tool_name.as_str();
     let mut outputs: Vec<Value> = Vec::new();
+    let mut delivery_ack = None;
 
     // Clear blocked status if tool completed
     if instance_data.status == ST_BLOCKED {
@@ -946,16 +988,21 @@ fn handle_posttooluse(
     }
 
     // Message delivery for ALL tools (parent only)
-    if let Some(output) = get_posttooluse_messages(db, instance_name) {
+    if let Some((output, ack)) = get_posttooluse_messages(db, instance_name) {
         outputs.push(output);
+        delivery_ack = Some(ack);
     }
 
     if !outputs.is_empty() {
         let combined = combine_posttooluse_outputs(&outputs);
-        return (0, serde_json::to_string(&combined).unwrap_or_default());
+        return (
+            0,
+            serde_json::to_string(&combined).unwrap_or_default(),
+            delivery_ack,
+        );
     }
 
-    (0, String::new())
+    (0, String::new(), None)
 }
 
 /// Defensive fallback bootstrap injection at PostToolUse.
@@ -979,21 +1026,25 @@ fn inject_bootstrap_if_needed(
 }
 
 /// Check for unread messages to deliver at PostToolUse.
-fn get_posttooluse_messages(db: &HcomDb, instance_name: &str) -> Option<Value> {
-    let raw_messages = db.get_unread_messages(instance_name);
-    let batch = common::prepare_delivery_batch(db, instance_name, raw_messages)?;
-    let model_context = batch.format_model_context(db, instance_name);
+fn get_posttooluse_messages(db: &HcomDb, instance_name: &str) -> Option<(Value, DeliveryAck)> {
+    let prepared = common::prepare_pending_messages(db, instance_name)?;
+    let model_context =
+        common::format_messages_json_for_instance(db, &prepared.messages, instance_name);
 
     // Claude needs user-facing display in addition to model context
-    let user_display = batch.format_user_display(db, instance_name);
+    let user_display =
+        common::format_hook_messages_for_instance(db, &prepared.messages, instance_name);
 
-    Some(serde_json::json!({
-        "systemMessage": user_display,
-        "hookSpecificOutput": {
-            "hookEventName": "PostToolUse",
-            "additionalContext": model_context,
-        },
-    }))
+    Some((
+        serde_json::json!({
+            "systemMessage": user_display,
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": model_context,
+            },
+        }),
+        prepared.ack,
+    ))
 }
 
 /// Combine multiple PostToolUse outputs with \n\n---\n\n separator.
@@ -1103,7 +1154,7 @@ fn handle_userpromptsubmit(
     instance_name: &str,
     updates: &serde_json::Map<String, Value>,
     instance_data: &InstanceRow,
-) -> (i32, String) {
+) -> (i32, String, Option<DeliveryAck>) {
     let name_announced = instance_data.name_announced != 0;
 
     // Persist updates
@@ -1125,29 +1176,34 @@ fn handle_userpromptsubmit(
         });
         paths::increment_flag_counter("instance_count");
         lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
-        return (0, serde_json::to_string(&output).unwrap_or_default());
+        return (0, serde_json::to_string(&output).unwrap_or_default(), None);
     }
 
     // PTY mode: deliver messages
-    if ctx.is_pty_mode {
-        let raw_messages = db.get_unread_messages(instance_name);
-        if let Some(batch) = common::prepare_delivery_batch(db, instance_name, raw_messages) {
-            let user_display = batch.format_user_display(db, instance_name);
-            let model_context = batch.format_model_context(db, instance_name);
+    if ctx.is_pty_mode
+        && let Some(prepared) = common::prepare_pending_messages(db, instance_name)
+    {
+        let user_display =
+            common::format_hook_messages_for_instance(db, &prepared.messages, instance_name);
+        let model_context =
+            common::format_messages_json_for_instance(db, &prepared.messages, instance_name);
 
-            let output = serde_json::json!({
-                "systemMessage": user_display,
-                "hookSpecificOutput": {
-                    "hookEventName": "UserPromptSubmit",
-                    "additionalContext": model_context,
-                },
-            });
-            return (0, serde_json::to_string(&output).unwrap_or_default());
-        }
+        let output = serde_json::json!({
+            "systemMessage": user_display,
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": model_context,
+            },
+        });
+        return (
+            0,
+            serde_json::to_string(&output).unwrap_or_default(),
+            Some(prepared.ack),
+        );
     }
 
     lifecycle::set_status(db, instance_name, ST_ACTIVE, "prompt", Default::default());
-    (0, String::new())
+    (0, String::new(), None)
 }
 
 /// Parent PermissionRequest: mark instance blocked immediately on approval UI.
@@ -1764,12 +1820,12 @@ fn subagent_stop(db: &HcomDb, raw: &Value, session_id: &str) -> (i32, String) {
 /// Subagent PostToolUse: message delivery for subagents running hcom commands.
 ///
 /// Returns (exit_code, stdout).
-fn subagent_posttooluse(db: &HcomDb, raw: &Value) -> (i32, String) {
+fn subagent_posttooluse(db: &HcomDb, raw: &Value) -> (i32, String, Option<DeliveryAck>) {
     let tool_input = raw.get("tool_input").unwrap_or(&Value::Null);
     let tool_name = raw.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
 
     if tool_name != "Bash" {
-        return (0, String::new());
+        return (0, String::new(), None);
     }
 
     let command = tool_input
@@ -1777,31 +1833,31 @@ fn subagent_posttooluse(db: &HcomDb, raw: &Value) -> (i32, String) {
         .and_then(|v| v.as_str())
         .unwrap_or("");
     if !command.contains("--name") {
-        return (0, String::new());
+        return (0, String::new(), None);
     }
 
     let agent_id = match extract_name(command) {
         Some(name) => name,
-        None => return (0, String::new()),
+        None => return (0, String::new(), None),
     };
 
     let subagent_name = match db.get_instance_by_agent_id(&agent_id) {
         Ok(Some(name)) => name,
-        _ => return (0, String::new()),
+        _ => return (0, String::new(), None),
     };
 
     // Check instance exists (row exists = participating)
     let _data = match db.get_instance_full(&subagent_name) {
         Ok(Some(data)) => data,
-        _ => return (0, String::new()),
+        _ => return (0, String::new(), None),
     };
 
     // Message delivery
-    let raw_messages = db.get_unread_messages(&subagent_name);
-    let Some(batch) = common::prepare_delivery_batch(db, &subagent_name, raw_messages) else {
-        return (0, String::new());
+    let Some(prepared) = common::prepare_pending_messages(db, &subagent_name) else {
+        return (0, String::new(), None);
     };
-    let formatted = batch.format_model_context(db, &subagent_name);
+    let formatted =
+        common::format_messages_json_for_instance(db, &prepared.messages, &subagent_name);
 
     let output = serde_json::json!({
         "hookSpecificOutput": {
@@ -1809,7 +1865,11 @@ fn subagent_posttooluse(db: &HcomDb, raw: &Value) -> (i32, String) {
             "additionalContext": formatted,
         }
     });
-    (0, serde_json::to_string(&output).unwrap_or_default())
+    (
+        0,
+        serde_json::to_string(&output).unwrap_or_default(),
+        Some(prepared.ack),
+    )
 }
 
 /// Detect and process vanilla instance binding from `hcom start` output.
@@ -2545,6 +2605,50 @@ mod tests {
         (dir, db)
     }
 
+    fn make_delivery_test_db() -> (tempfile::TempDir, HcomDb) {
+        let (dir, db) = make_test_db();
+        db.conn()
+            .execute(
+                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, last_event_id)
+                 VALUES ('nova', 'claude', 'listening', 'start', 0, 0, 0)",
+                [],
+            )
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO events (type, timestamp, instance, data)
+                 VALUES ('message', '2026-01-01T00:00:00Z', 'luna', '{\"from\":\"luna\",\"text\":\"hello\",\"scope\":\"broadcast\"}')",
+                [],
+            )
+            .unwrap();
+        (dir, db)
+    }
+
+    fn delivery_cursor(db: &HcomDb) -> i64 {
+        db.conn()
+            .query_row(
+                "SELECT last_event_id FROM instances WHERE name = 'nova'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "test write failure",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn test_get_real_session_id_normal() {
         let raw = serde_json::json!({"session": {"session_id": "abc-123"}});
@@ -2612,24 +2716,9 @@ mod tests {
     }
 
     #[test]
-    fn test_get_posttooluse_messages_returns_dual_output() {
-        let (_dir, db) = make_test_db();
-        db.conn()
-            .execute(
-                "INSERT INTO instances (name, tool, status, status_context, status_time, created_at, last_event_id)
-                 VALUES ('nova', 'claude', 'listening', 'start', 0, 0, 0)",
-                [],
-            )
-            .unwrap();
-        db.conn()
-            .execute(
-                "INSERT INTO events (type, timestamp, instance, data)
-                 VALUES ('message', '2026-01-01T00:00:00Z', 'luna', '{\"from\":\"luna\",\"text\":\"hello\",\"scope\":\"broadcast\"}')",
-                [],
-            )
-            .unwrap();
-
-        let output = get_posttooluse_messages(&db, "nova").unwrap();
+    fn test_posttooluse_delivery_commits_after_output_write() {
+        let (_dir, db) = make_delivery_test_db();
+        let (output, ack) = get_posttooluse_messages(&db, "nova").unwrap();
         let system_message = output["systemMessage"].as_str().unwrap();
         assert!(system_message.contains("luna"));
         assert!(system_message.contains("nova"));
@@ -2639,6 +2728,27 @@ mod tests {
             .unwrap();
         assert!(ctx.contains("luna"));
         assert!(ctx.contains("hello"));
+
+        assert_eq!(delivery_cursor(&db), 0);
+        let stdout = serde_json::to_string(&output).unwrap();
+        let mut writer = Vec::new();
+        write_hook_output(&db, &mut writer, &stdout, Some(&ack)).unwrap();
+
+        assert_eq!(writer, stdout.as_bytes());
+        assert_eq!(delivery_cursor(&db), ack.last_event_id);
+    }
+
+    #[test]
+    fn test_posttooluse_delivery_write_failure_keeps_message_unread() {
+        let (_dir, db) = make_delivery_test_db();
+        let (output, ack) = get_posttooluse_messages(&db, "nova").unwrap();
+        let stdout = serde_json::to_string(&output).unwrap();
+
+        let error = write_hook_output(&db, &mut FailingWriter, &stdout, Some(&ack)).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(delivery_cursor(&db), 0);
+        assert_eq!(db.get_unread_messages("nova").len(), 1);
     }
 
     #[test]
