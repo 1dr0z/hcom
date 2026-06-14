@@ -358,7 +358,7 @@ pub(crate) fn retry_codex_transcript(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transcript::{ReadOptions, ToolKind, read};
+    use crate::transcript::{ReadOptions, TranscriptBackend, read};
     use std::fs;
 
     #[test]
@@ -551,7 +551,7 @@ mod tests {
             session_id: None,
             allow_codex_retry: true,
         };
-        let exchanges = read(&transcript_path, ToolKind::Codex, &opts).unwrap();
+        let exchanges = read(&transcript_path, TranscriptBackend::CodexJsonl, &opts).unwrap();
         assert_eq!(exchanges.len(), 1);
         assert_eq!(exchanges[0].action, "assistant answer");
     }

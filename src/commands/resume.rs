@@ -11,7 +11,7 @@ use crate::commands::launch::{
     LaunchOutputContext, LaunchPreview, extract_launch_flags, is_background_from_args,
     load_hcom_config, print_launch_feedback, print_launch_preview, resolve_launcher_name,
 };
-use crate::commands::transcript::{claude_config_dir, detect_agent_type};
+use crate::commands::transcript::detect_agent_type;
 use crate::db::HcomDb;
 use crate::hooks::codex::derive_codex_transcript_path;
 use crate::hooks::gemini::derive_gemini_transcript_path;
@@ -20,6 +20,7 @@ use crate::launcher::{self, LaunchParams, LaunchResult};
 use crate::log::log_info;
 use crate::router::GlobalFlags;
 use crate::shared::ST_INACTIVE;
+use crate::transcript::claude_projects_dir;
 
 /// Where to load the resume/fork plan from.
 enum ResumeSource<'a> {
@@ -1484,7 +1485,7 @@ struct ThreadMatch {
 /// we bail rather than silently pick the most recent — the user may have
 /// accidentally reused a name.
 fn resolve_claude_thread_name(name: &str) -> Result<Option<String>> {
-    let projects_dir = claude_config_dir().join("projects");
+    let projects_dir = claude_projects_dir();
     if !projects_dir.is_dir() {
         return Ok(None);
     }
@@ -1761,7 +1762,7 @@ fn find_session_on_disk(session_id: &str) -> Option<(String, Option<String>)> {
     }
 
     // 2. Claude: iterate project dirs, check for exact filename
-    let projects_dir = claude_config_dir().join("projects");
+    let projects_dir = claude_projects_dir();
     if projects_dir.is_dir()
         && let Ok(entries) = std::fs::read_dir(&projects_dir)
     {
@@ -2073,7 +2074,7 @@ fn build_adopt_plan(
                 kilo_db = kilo_db,
             )
         } else {
-            let claude_projects = claude_config_dir().join("projects");
+            let claude_projects = claude_projects_dir();
             anyhow::anyhow!(
                 "Session {sid} not found. Searched:\n  \
                  - Claude:   {claude}/*/{sid}.jsonl\n  \

@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 
 use crate::db::HcomDb;
 use crate::shared::CommandContext;
+use crate::tool::Tool;
 use crate::transcript::{self, Exchange, ReadOptions, format_exchanges, summarize_action};
 
 /// Parsed arguments for `hcom transcript`.
@@ -72,7 +73,7 @@ pub struct TranscriptSearchArgs {
     /// Max results (default: 20)
     #[arg(long, default_value = "20")]
     pub limit: usize,
-    /// Filter by agent type (claude, gemini, codex, opencode, kilo, kimi)
+    /// Filter by exact agent type (canonical name or declared alias)
     #[arg(long)]
     pub agent: Option<String>,
 }
@@ -108,62 +109,46 @@ fn truncate_str(s: &str, max: usize) -> &str {
 
 // ── Transcript Path Discovery ────────────────────────────────────────────
 
-/// Get Claude config directory.
-pub(crate) fn claude_config_dir() -> PathBuf {
-    std::env::var("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".claude"))
-}
-
-/// Detect agent type from transcript path.
-pub(crate) fn detect_agent_type(path: &str) -> &str {
-    let lower = path.to_ascii_lowercase();
-    if lower.contains("antigravity") || lower.contains("/agy/") || lower.contains("/agy-") {
-        "antigravity"
-    } else if lower.contains("agent-transcripts") {
-        // Cursor transcripts live at
-        // `~/.cursor/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl`. Key
-        // off the `agent-transcripts` segment — unique to cursor (claude/gemini/
-        // codex never produce it) and separator-independent. A bare `.cursor`
-        // substring is NOT cursor-unique: a Claude transcript whose cwd-slug
-        // contains a checked-in `.cursor/` rules dir would misroute. Must
-        // precede the Claude `/projects/` catch (cursor paths contain it too).
-        "cursor"
-    } else if path.contains(".claude") || path.contains("/projects/") {
-        "claude"
-    } else if lower.contains(".gemini") {
-        "gemini"
-    } else if lower.contains(".codex") || lower.contains("codex") {
-        "codex"
-    } else if lower.contains(".copilot")
-        || (lower.contains("session-state") && lower.ends_with("events.jsonl"))
-    {
-        // Copilot transcripts: `~/.copilot/session-state/<uuid>/events.jsonl`.
-        // Require the `events.jsonl` tail so a bare `session-state` segment in an
-        // unrelated path can't misroute (mirrors `detect_kind_from_path`).
-        "copilot"
-    } else if lower.contains(".pi/agent/sessions")
-        || lower.contains(".pi/sessions")
-        || lower.contains("pi_coding_agent_session")
-    {
-        "pi"
-    } else if lower.contains("opencode") {
-        "opencode"
-    } else if lower.contains("kilo") {
-        "kilo"
-    } else if lower.contains("kimi") {
-        "kimi"
-    } else {
-        "unknown"
-    }
+/// Detect canonical agent type from transcript path.
+pub(crate) fn detect_agent_type(path: &str) -> &'static str {
+    transcript::agent_name_from_path(path)
 }
 
 fn transcript_search_key(path: &str, session_id: Option<&str>) -> String {
     format!("{path}\u{0}{}", session_id.unwrap_or(""))
 }
 
-fn transcript_agent_matches(filter: Option<&str>, agent: &str) -> bool {
-    filter.is_none_or(|f| agent.contains(f) || f.contains(agent))
+/// Attribute a `--all` disk match to a canonical tool.
+///
+/// Content detection wins when it lands on a selected tool: it resolves every
+/// signatured format and the one shared root (gemini/antigravity under
+/// `~/.gemini`). Otherwise the file is attributed by provenance — the search
+/// root it was found under — which is what classifies unsignatured sessions such
+/// as pi's bare `<uuid>.jsonl` reached via a custom `PI_CODING_AGENT_SESSION_DIR`.
+/// Provenance is only trusted when exactly one selected root owns the path, so
+/// the shared gemini/antigravity root never guesses.
+fn attribute_disk_match(
+    file_path: &str,
+    selected: &[Tool],
+    root_owners: &[(PathBuf, Tool)],
+) -> Option<Tool> {
+    if let Some(detected) = transcript::detect_tool_from_path(file_path)
+        && selected.contains(&detected)
+    {
+        return Some(detected);
+    }
+    let path = Path::new(file_path);
+    let mut owner: Option<Tool> = None;
+    for (root, tool) in root_owners {
+        if selected.contains(tool) && path.starts_with(root) {
+            match owner {
+                None => owner = Some(*tool),
+                Some(existing) if existing == *tool => {}
+                Some(_) => return None, // ambiguous provenance — do not guess
+            }
+        }
+    }
+    owner
 }
 
 /// Get transcript path for an instance from DB.
@@ -202,14 +187,14 @@ fn get_exchanges(
     session_id: Option<&str>,
     retry_codex: bool,
 ) -> Result<Vec<Exchange>, String> {
-    let kind = transcript::kind_from_agent_or_path(agent, path)?;
+    let backend = transcript::backend_from_agent_or_path(agent, path)?;
     let opts = ReadOptions {
         last,
         detailed,
         session_id: session_id.map(|s| s.to_string()),
         allow_codex_retry: retry_codex,
     };
-    transcript::read(Path::new(path), kind, &opts)
+    transcript::read(Path::new(path), backend, &opts)
 }
 
 // ── Search ───────────────────────────────────────────────────────────────
@@ -284,7 +269,16 @@ fn cmd_transcript_search(
     let all_mode = args.all;
     let json_mode = args.json;
     let limit = args.limit;
-    let agent_filter = args.agent.as_ref();
+    let agent_filter = match args.agent.as_deref() {
+        Some(value) => match transcript::parse_tool_filter(value) {
+            Ok(tool) => Some(tool),
+            Err(error) => {
+                eprintln!("Error: {error}");
+                return 1;
+            }
+        },
+        None => None,
+    };
 
     // Resolve self name for --exclude-self
     let ctx_name = if args.exclude_self {
@@ -302,85 +296,79 @@ fn cmd_transcript_search(
     let mut seen = std::collections::HashSet::new();
 
     if all_mode {
-        // --all: search disk-wide directories (not just hcom-tracked instances)
+        // --all: derive file roots and database sources from canonical tools.
+        let selected_tools = agent_filter
+            .map(|tool| vec![tool])
+            .unwrap_or_else(transcript::transcript_tools);
         let mut search_dirs: Vec<PathBuf> = Vec::new();
-        let agent_filter = agent_filter.map(|s| s.as_str());
-        let opencode_db = if transcript_agent_matches(agent_filter, "opencode") {
-            transcript::get_opencode_db_path()
-        } else {
-            None
-        };
-        let kilo_db = if transcript_agent_matches(agent_filter, "kilo") {
-            transcript::get_kilo_db_path()
-        } else {
-            None
-        };
+        // Remember which tool each search root belongs to so matches found under
+        // an override root with no content signature (e.g. pi's bare
+        // `<uuid>.jsonl` under a custom PI_CODING_AGENT_SESSION_DIR) can still be
+        // attributed. A path can map to more than one tool — gemini and
+        // antigravity share `~/.gemini` — which `attribute_disk_match` treats as
+        // ambiguous and defers to content detection.
+        let mut root_owners: Vec<(PathBuf, Tool)> = Vec::new();
+        for tool in &selected_tools {
+            for path in transcript::disk_search_roots(*tool) {
+                if path.exists() {
+                    if !search_dirs.contains(&path) {
+                        search_dirs.push(path.clone());
+                    }
+                    root_owners.push((path, *tool));
+                }
+            }
+        }
+        let database_sources: Vec<(Tool, PathBuf)> = selected_tools
+            .iter()
+            .filter_map(|tool| transcript::database_search_path(*tool).map(|path| (*tool, path)))
+            .collect();
 
-        if transcript_agent_matches(agent_filter, "claude") {
-            let p = claude_config_dir().join("projects");
-            if p.exists() {
-                search_dirs.push(p);
-            }
-        }
-        if transcript_agent_matches(agent_filter, "gemini") {
-            let home = dirs::home_dir().unwrap_or_default();
-            let p = home.join(".gemini");
-            if p.exists() {
-                search_dirs.push(p);
-            }
-        }
-        if transcript_agent_matches(agent_filter, "codex") {
-            let home = dirs::home_dir().unwrap_or_default();
-            let p = home.join(".codex").join("sessions");
-            if p.exists() {
-                search_dirs.push(p);
-            }
-        }
-
-        if search_dirs.is_empty() && opencode_db.is_none() && kilo_db.is_none() {
-            println!("No transcript directories found on disk.");
+        if search_dirs.is_empty() && database_sources.is_empty() {
+            println!("No transcript directories or databases found on disk.");
             return 0;
         }
 
-        // Phase 1: find matching files with rg -l (recursive, *.jsonl/*.json)
-        let mut cmd = std::process::Command::new("rg");
-        cmd.args(["-l", "--glob", "*.jsonl", "--glob", "*.json", pattern]);
-        for d in &search_dirs {
-            cmd.arg(d);
+        // Phase 1: find matching files with rg -l (recursive, *.jsonl/*.json).
+        // Avoid invoking rg without a path when only SQLite sources exist; that
+        // would make it read stdin and potentially block an interactive command.
+        let matching_files: Vec<String> = if search_dirs.is_empty() {
+            Vec::new()
+        } else {
+            let mut cmd = std::process::Command::new("rg");
+            cmd.args(["-l", "--glob", "*.jsonl", "--glob", "*.json", pattern]);
+            for d in &search_dirs {
+                cmd.arg(d);
+            }
+            match cmd.output() {
+                Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+
+        let mut database_matches = Vec::new();
+        for (tool, db_path) in &database_sources {
+            if database_matches.len() >= limit {
+                break;
+            }
+            match transcript::search_database_sessions(
+                *tool,
+                db_path,
+                pattern,
+                limit - database_matches.len(),
+            ) {
+                Ok(matches) => database_matches.extend(matches),
+                Err(err) => {
+                    eprintln!("Error: {err}");
+                    return 1;
+                }
+            }
         }
-        let output = cmd.output();
-        let matching_files: Vec<String> = match output {
-            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .filter(|l| !l.is_empty())
-                .map(|l| l.to_string())
-                .collect(),
-            _ => Vec::new(),
-        };
 
-        let opencode_matches = opencode_db
-            .as_deref()
-            .map(|db_path| transcript::search_opencode_sessions(db_path, pattern, limit))
-            .transpose();
-        let kilo_matches = kilo_db
-            .as_deref()
-            .map(|db_path| transcript::search_kilo_sessions(db_path, pattern, limit))
-            .transpose();
-        let opencode_matches = match (opencode_matches, kilo_matches) {
-            (Ok(Some(mut matches)), Ok(Some(kilo))) => {
-                matches.extend(kilo);
-                matches
-            }
-            (Ok(Some(matches)), Ok(None)) => matches,
-            (Ok(None), Ok(Some(matches))) => matches,
-            (Ok(None), Ok(None)) => Vec::new(),
-            (Err(err), _) | (_, Err(err)) => {
-                eprintln!("Error: {err}");
-                return 1;
-            }
-        };
-
-        if matching_files.is_empty() && opencode_matches.is_empty() {
+        if matching_files.is_empty() && database_matches.is_empty() {
             if json_mode {
                 println!("{}", json!({"count": 0, "results": [], "scope": "all"}));
             } else {
@@ -396,7 +384,7 @@ fn cmd_transcript_search(
             .map(|path| (path, None))
             .collect();
         targets.extend(
-            opencode_matches
+            database_matches
                 .iter()
                 .filter_map(|m| m.session_id.clone().map(|sid| (m.path.clone(), Some(sid)))),
         );
@@ -408,12 +396,12 @@ fn cmd_transcript_search(
             if results.len() >= limit {
                 break;
             }
-            let agent = detect_agent_type(file_path);
-            if let Some(af) = agent_filter
-                && !agent.contains(af)
-            {
+            let Some(detected_tool) =
+                attribute_disk_match(file_path, &selected_tools, &root_owners)
+            else {
                 continue;
-            }
+            };
+            let agent = detected_tool.as_str();
             let hcom_name = path_to_hcom
                 .get(&transcript_search_key(file_path, None))
                 .cloned()
@@ -460,79 +448,75 @@ fn cmd_transcript_search(
             }
         }
 
-        for opencode_match in &opencode_matches {
+        for database_match in &database_matches {
             if results.len() >= limit {
                 break;
             }
             let hcom_name = path_to_hcom
                 .get(&transcript_search_key(
-                    &opencode_match.path,
-                    opencode_match.session_id.as_deref(),
+                    &database_match.path,
+                    database_match.session_id.as_deref(),
                 ))
                 .cloned()
                 .unwrap_or_default();
             results.push(json!({
                 "hcom_name": if hcom_name.is_empty() { serde_json::Value::Null } else { json!(hcom_name) },
-                "agent": opencode_match.agent,
-                "path": opencode_match.path,
-                "line": opencode_match.line,
-                "text": opencode_match.text,
-                "matches": opencode_match.matches,
-                "session_id": opencode_match.session_id,
-                "label": opencode_match.label,
+                "agent": database_match.agent,
+                "path": database_match.path,
+                "line": database_match.line,
+                "text": database_match.text,
+                "matches": database_match.matches,
+                "session_id": database_match.session_id,
+                "label": database_match.label,
             }));
         }
 
-        let scope_label = "";
         if json_mode {
             println!(
                 "{}",
                 json!({"count": results.len(), "results": results, "scope": "all"})
             );
+        } else if results.is_empty() {
+            println!("No matches for \"{pattern}\"");
         } else {
-            if results.is_empty() {
-                println!("No matches for \"{pattern}\"");
-            } else {
-                let _ = scope_label;
-                println!(
-                    "Found matches in {} transcripts (all on disk):",
-                    results.len()
-                );
-                for r in &results {
-                    let path = r["path"].as_str().unwrap_or("");
-                    let agent = r["agent"].as_str().unwrap_or("?");
-                    let line = r["line"].as_u64().unwrap_or(0);
-                    let matches = r["matches"].as_u64().unwrap_or(0);
-                    let snippet = r["text"].as_str().unwrap_or("");
-                    let label = r["label"].as_str().unwrap_or("");
-                    let session_id = r["session_id"].as_str().unwrap_or("");
-                    let short_path = path
-                        .split('/')
-                        .rev()
-                        .take(3)
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect::<Vec<_>>()
-                        .join("/");
-                    let name_part = r["hcom_name"]
-                        .as_str()
-                        .map(|n| format!(" ({n})"))
-                        .unwrap_or_default();
-                    println!("  [{agent}]{name_part} .../{short_path}:{line}  ({matches} matches)");
-                    if !label.is_empty() || !session_id.is_empty() {
-                        let mut details = Vec::new();
-                        if !label.is_empty() {
-                            details.push(label.to_string());
-                        }
-                        if !session_id.is_empty() {
-                            details.push(session_id.to_string());
-                        }
-                        println!("    {}", details.join(" | "));
+            println!(
+                "Found matches in {} transcripts (all on disk):",
+                results.len()
+            );
+            for r in &results {
+                let path = r["path"].as_str().unwrap_or("");
+                let agent = r["agent"].as_str().unwrap_or("?");
+                let line = r["line"].as_u64().unwrap_or(0);
+                let matches = r["matches"].as_u64().unwrap_or(0);
+                let snippet = r["text"].as_str().unwrap_or("");
+                let label = r["label"].as_str().unwrap_or("");
+                let session_id = r["session_id"].as_str().unwrap_or("");
+                let short_path = path
+                    .split('/')
+                    .rev()
+                    .take(3)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join("/");
+                let name_part = r["hcom_name"]
+                    .as_str()
+                    .map(|n| format!(" ({n})"))
+                    .unwrap_or_default();
+                println!("  [{agent}]{name_part} .../{short_path}:{line}  ({matches} matches)");
+                if !label.is_empty() || !session_id.is_empty() {
+                    let mut details = Vec::new();
+                    if !label.is_empty() {
+                        details.push(label.to_string());
                     }
-                    if !snippet.is_empty() {
-                        println!("    {snippet}");
+                    if !session_id.is_empty() {
+                        details.push(session_id.to_string());
                     }
+                    println!("    {}", details.join(" | "));
+                }
+                if !snippet.is_empty() {
+                    println!("    {snippet}");
                 }
             }
         }
@@ -550,8 +534,11 @@ fn cmd_transcript_search(
                 ))
             }) {
                 for (name, path, tool) in rows.flatten() {
-                    if let Some(agent) = agent_filter
-                        && !tool.contains(agent.as_str()) { continue; }
+                    if let Some(filter_tool) = agent_filter
+                        && transcript::tool_from_agent_or_path(&tool, &path).ok() != Some(filter_tool)
+                    {
+                        continue;
+                    }
                     if args.exclude_self && ctx_name.as_deref() == Some(name.as_str()) { continue; }
                     seen.insert(name.clone());
                     paths.push((name, path, tool));
@@ -572,8 +559,11 @@ fn cmd_transcript_search(
                 }) {
                     for (name, path, tool) in rows.flatten() {
                         if seen.contains(&name) { continue; }
-                        if let Some(agent) = agent_filter
-                            && !tool.contains(agent.as_str()) { continue; }
+                        if let Some(filter_tool) = agent_filter
+                            && transcript::tool_from_agent_or_path(&tool, &path).ok() != Some(filter_tool)
+                        {
+                            continue;
+                        }
                         if args.exclude_self && ctx_name.as_deref() == Some(name.as_str()) { continue; }
                         seen.insert(name.clone());
                         paths.push((name, path, tool));
@@ -1352,7 +1342,7 @@ mod tests {
             "claude"
         );
         assert_eq!(
-            detect_agent_type("/home/user/.gemini/tmp/session.json"),
+            detect_agent_type("/home/user/.gemini/tmp/project/chats/session-1-abc.json"),
             "gemini"
         );
         assert_eq!(
@@ -1381,7 +1371,10 @@ mod tests {
     fn detect_agent_type_covers_released_integrations_with_transcript_parsers() {
         let cases = [
             ("/home/user/.claude/projects/x/transcript.jsonl", "claude"),
-            ("/home/user/.gemini/tmp/session.json", "gemini"),
+            (
+                "/home/user/.gemini/tmp/project/chats/session-1-abc.json",
+                "gemini",
+            ),
             ("/home/user/.codex/sessions/x/rollout.jsonl", "codex"),
             ("/home/user/.local/share/opencode/opencode.db", "opencode"),
             ("/home/user/.local/share/kilo/kilo.db", "kilo"),
@@ -1394,7 +1387,7 @@ mod tests {
                 "cursor",
             ),
             (
-                "/home/user/.kimi/sessions/abc123/def456/context.jsonl",
+                "/home/user/.kimi-code/sessions/wd_x/abc123/agents/main/wire.jsonl",
                 "kimi",
             ),
             (
@@ -1419,6 +1412,46 @@ mod tests {
         assert_eq!(
             actual, expected,
             "transcript path detection cases must cover every released integration"
+        );
+    }
+
+    #[test]
+    fn attribute_disk_match_uses_provenance_for_unsignatured_pi_sessions() {
+        let pi_root = PathBuf::from("/data/pi-sessions");
+        let gem_root = PathBuf::from("/home/u/.gemini");
+        let owners = vec![
+            (pi_root.clone(), Tool::Pi),
+            // gemini and antigravity share one root — the ambiguous case.
+            (gem_root.clone(), Tool::Gemini),
+            (gem_root.clone(), Tool::Antigravity),
+        ];
+        let selected = [Tool::Pi, Tool::Gemini, Tool::Antigravity];
+
+        // A bare uuid.jsonl under a custom PI_CODING_AGENT_SESSION_DIR has no
+        // content signature, so it is attributed by provenance.
+        assert_eq!(
+            attribute_disk_match("/data/pi-sessions/abc/9f8e.jsonl", &selected, &owners),
+            Some(Tool::Pi)
+        );
+        // A signatured gemini file under the shared root resolves by content.
+        assert_eq!(
+            attribute_disk_match(
+                "/home/u/.gemini/tmp/p/chats/session-1-x.json",
+                &selected,
+                &owners
+            ),
+            Some(Tool::Gemini)
+        );
+        // An unsignatured file under the shared gemini/antigravity root is
+        // ambiguous by provenance and must not be guessed.
+        assert_eq!(
+            attribute_disk_match("/home/u/.gemini/tmp/p/notes.jsonl", &selected, &owners),
+            None
+        );
+        // Provenance only counts roots for selected tools.
+        assert_eq!(
+            attribute_disk_match("/data/pi-sessions/abc/9f8e.jsonl", &[Tool::Gemini], &owners),
+            None
         );
     }
 
